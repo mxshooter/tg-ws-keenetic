@@ -1,11 +1,19 @@
 """Logging configuration for both daemon and CLI invocations."""
 from __future__ import annotations
 
+import collections
 import logging
 import logging.handlers
 import os
 import re
-from typing import Optional
+import threading
+import uuid
+from typing import List, Optional, Tuple
+
+
+# How many formatted log lines to keep in memory for the web UI. Bounded so a
+# long-running service can't grow without limit on a memory-constrained router.
+LOG_BUFFER_LINES = 2000
 
 
 class DomainCensorFilter(logging.Filter):
@@ -42,13 +50,56 @@ class DomainCensorFilter(logging.Filter):
         return True
 
 
+class RingLogHandler(logging.Handler):
+    """Keeps recent formatted log lines in memory for the web UI.
+
+    Records are numbered with a monotonically increasing sequence so the UI can
+    fetch only what it has not seen yet (`snapshot(since=...)`). A fresh
+    `session` id is generated per process, letting the UI detect a restart and
+    reset its view. Thread-safe: the CF-domain refresh runs on its own thread.
+    """
+
+    def __init__(self, capacity: int = LOG_BUFFER_LINES) -> None:
+        super().__init__()
+        self._buf: "collections.deque[Tuple[int, str]]" = collections.deque(
+            maxlen=max(1, capacity)
+        )
+        self._seq = 0
+        self._lock = threading.Lock()
+        self.session = uuid.uuid4().hex
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            line = self.format(record)
+        except Exception:
+            self.handleError(record)
+            return
+        with self._lock:
+            self._seq += 1
+            self._buf.append((self._seq, line))
+
+    def snapshot(self, since: int = 0) -> Tuple[int, List[str]]:
+        """Return (current_seq, lines) with sequence numbers strictly > since."""
+        with self._lock:
+            return self._seq, [line for seq, line in self._buf if seq > since]
+
+
+# Set by `configure_logging`; read by the web UI. None until then.
+_log_buffer: Optional[RingLogHandler] = None
+
+
+def get_log_buffer() -> Optional[RingLogHandler]:
+    return _log_buffer
+
+
 def configure_logging(
     log_file: Optional[str],
     max_mb: float,
     backups: int,
     verbose: bool,
 ) -> None:
-    """Reset root logging to one console + optional rotating file handler."""
+    """Reset root logging to console + optional file + in-memory ring."""
+    global _log_buffer
     level = logging.DEBUG if verbose else logging.INFO
     fmt = logging.Formatter(
         "%(asctime)s  %(levelname)-5s  %(name)s  %(message)s",
@@ -82,5 +133,12 @@ def configure_logging(
         except OSError as exc:
             root.warning("Cannot open log file %s: %s", log_file, exc)
 
+    # In-memory buffer powering the web UI's log viewer.
+    _log_buffer = RingLogHandler()
+    _log_buffer.setFormatter(fmt)
+    _log_buffer.addFilter(censor)
+    root.addHandler(_log_buffer)
+
     # Quiet down chatty asyncio.
     logging.getLogger("asyncio").setLevel(logging.WARNING)
+

@@ -21,11 +21,22 @@
         updResult:  $('#update-result'),
         updCheck:   $('#btn-update-check'),
         updApply:   $('#btn-update-apply'),
+        logView:    $('#log-view'),
+        logStatus:  $('#log-status'),
+        logAutoscroll: $('#log-autoscroll'),
+        logRefresh: $('#btn-log-refresh'),
+        logClear:   $('#btn-log-clear'),
     };
 
     let lastUpdateInfo = null;
 
     let lastConfig = null;
+
+    // In-memory log polling state.
+    let logSession = null;
+    let logCursor = 0;
+    let logLines = [];
+    const LOG_MAX_LINES = 2000;
 
     async function api(method, path, body) {
         const headers = {};
@@ -291,4 +302,49 @@
         checkForUpdates({ silent: true });
     })();
     setInterval(refresh, 5000);
+
+    // ---- log viewer -----------------------------------------------------
+
+    function renderLog() {
+        const atBottom = els.logAutoscroll.checked;
+        els.logView.textContent = logLines.length
+            ? logLines.join('\n')
+            : 'Журнал пуст.';
+        if (atBottom) els.logView.scrollTop = els.logView.scrollHeight;
+        els.logStatus.textContent = `${logLines.length} строк`;
+    }
+
+    async function fetchLogs(initial) {
+        try {
+            const path = '/api/logs' + (initial ? '' : `?since=${logCursor}`);
+            const res = await api('GET', path);
+            // New process (restart) -> reset the buffer.
+            if (res.session && res.session !== logSession) {
+                logSession = res.session;
+                logLines = [];
+                logCursor = 0;
+            }
+            if (res.lines && res.lines.length) {
+                logLines = logLines.concat(res.lines);
+                if (logLines.length > LOG_MAX_LINES) {
+                    logLines = logLines.slice(logLines.length - LOG_MAX_LINES);
+                }
+            }
+            if (typeof res.cursor === 'number') logCursor = res.cursor;
+            renderLog();
+        } catch (e) {
+            els.logStatus.textContent = 'ошибка: ' + e.message;
+        }
+    }
+
+    els.logRefresh.addEventListener('click', () => fetchLogs(true));
+    els.logClear.addEventListener('click', () => {
+        logLines = [];
+        renderLog();
+    });
+
+    (async function initLogs() {
+        await fetchLogs(true);
+    })();
+    setInterval(() => fetchLogs(false), 3000);
 })();
