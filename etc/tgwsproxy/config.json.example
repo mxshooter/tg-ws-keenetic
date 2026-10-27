@@ -15,6 +15,8 @@
   "cfproxy": true,
   "cfproxy_user_domain": "",
   "cfproxy_worker_domain": "",
+  "cfproxy_h2_media": true,
+  "disable_secure": false,
   "fake_tls_domain": "",
   "link_host": "",
   "update_repo": "Omn1z/tg-ws-keenetic",

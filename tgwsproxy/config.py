@@ -145,7 +145,7 @@ def refresh_cfproxy_domains(user_overridden: bool = False) -> None:
     fetched = _fetch_cfproxy_domain_list(user_overridden=False)
     pool = _normalize_domain_pool(fetched)
     if len(pool) >= _CFPROXY_MIN_VALID_DOMAINS:
-        balancer.update_pool(pool)
+        balancer.update_domains_list(pool)
         log.info("CF proxy domain pool updated from GitHub (%d domains)", len(pool))
         return
     if fetched:
@@ -171,7 +171,7 @@ def start_cfproxy_domain_refresh(user_overridden: bool = False) -> None:
     stop = _refresh_stop
 
     if not user_overridden:
-        balancer.update_pool(CFPROXY_DEFAULT_DOMAINS)
+        balancer.update_domains_list(CFPROXY_DEFAULT_DOMAINS)
 
     def _loop():
         refresh_cfproxy_domains(user_overridden)
@@ -216,6 +216,10 @@ class Config:
     cfproxy: bool = True
     cfproxy_user_domain: str = ""
     cfproxy_worker_domain: str = ""
+    # Multiplex media traffic over HTTP/2 to the CF worker (needs httpx+h2).
+    cfproxy_h2_media: bool = True
+    # Use plain HTTP (port 80) for CF proxy/worker connections.
+    disable_secure: bool = False
 
     # Fake TLS masking
     fake_tls_domain: str = ""
@@ -240,6 +244,15 @@ class Config:
     web_password: str = ""
 
     # ---- helpers ---------------------------------------------------------
+
+    @property
+    def h2_enabled(self) -> bool:
+        return (
+            self.cfproxy_h2_media
+            and self.cfproxy
+            and not self.disable_secure
+            and not self.force_test_dc
+        )
 
     def ensure_secret(self) -> None:
         if not self.secret:
@@ -358,6 +371,8 @@ def _from_dict(raw: Dict[str, Any]) -> Config:
         cfproxy=bool(merged["cfproxy"]),
         cfproxy_user_domain=str(merged["cfproxy_user_domain"]),
         cfproxy_worker_domain=str(merged["cfproxy_worker_domain"]),
+        cfproxy_h2_media=bool(merged["cfproxy_h2_media"]),
+        disable_secure=bool(merged["disable_secure"]),
         fake_tls_domain=str(merged["fake_tls_domain"]),
         link_host=str(merged["link_host"]),
         update_repo=str(merged["update_repo"]),

@@ -21,6 +21,7 @@ from .constants import (
     PROTO_INT_PADDED_INTERMEDIATE,
 )
 from .crypto import ReencryptionContext
+from .network_debug import WsActivity
 from .stats import Stats, human_bytes
 from .websocket import RawWebSocket
 
@@ -145,9 +146,13 @@ async def bridge_ws(
     dc_tag = f"DC{dc}{'m' if is_media else ''}"
     start = asyncio.get_running_loop().time()
     up_bytes = down_bytes = up_packets = down_packets = 0
+    close_reason = "normal"
+    activity = (
+        WsActivity(label, dc_tag) if log.isEnabledFor(logging.DEBUG) else None
+    )
 
     async def client_to_upstream() -> None:
-        nonlocal up_bytes, up_packets
+        nonlocal up_bytes, up_packets, close_reason
         try:
             while True:
                 chunk = await client_reader.read(65536)
@@ -155,46 +160,76 @@ async def bridge_ws(
                     if splitter:
                         tail = splitter.flush()
                         if tail:
+                            if activity is not None:
+                                activity.send_started()
                             await ws.send(tail[0])
+                            if activity is not None:
+                                activity.sent(len(tail[0]))
                     break
-                up_bytes += len(chunk)
+                n = len(chunk)
+                if activity is not None:
+                    activity.input(n)
+                up_bytes += n
                 up_packets += 1
-                stats.bytes_up += len(chunk)
+                stats.bytes_up += n
                 plain = ctx.client_decrypt.update(chunk)
                 reencrypted = ctx.upstream_encrypt.update(plain)
                 if splitter:
                     parts = splitter.split(reencrypted, plain)
                     if not parts:
                         continue
+                    if activity is not None:
+                        activity.send_started()
                     if len(parts) > 1:
                         await ws.send_batch(parts)
                     else:
                         await ws.send(parts[0])
+                    if activity is not None:
+                        activity.sent(sum(map(len, parts)))
                 else:
+                    if activity is not None:
+                        activity.send_started()
                     await ws.send(reencrypted)
-        except (asyncio.CancelledError, ConnectionError, OSError):
+                    if activity is not None:
+                        activity.sent(len(reencrypted))
+        except asyncio.CancelledError:
             return
+        except (ConnectionError, OSError) as exc:
+            close_reason = f"client: {type(exc).__name__}"
         except Exception as exc:
+            close_reason = f"client: {type(exc).__name__}: {exc}"
             log.debug("[%s] tcp->ws ended: %s", label, exc)
 
     async def upstream_to_client() -> None:
-        nonlocal down_bytes, down_packets
+        nonlocal down_bytes, down_packets, close_reason
         try:
             while True:
                 data = await ws.recv()
                 if data is None:
+                    if close_reason == "normal":
+                        close_reason = "upstream: ws_close"
                     break
-                down_bytes += len(data)
+                n = len(data)
+                if activity is not None:
+                    activity.received(n)
+                down_bytes += n
                 down_packets += 1
-                stats.bytes_down += len(data)
+                stats.bytes_down += n
                 reencrypted = ctx.client_encrypt.update(
                     ctx.upstream_decrypt.update(data)
                 )
                 client_writer.write(reencrypted)
                 await client_writer.drain()
-        except (asyncio.CancelledError, ConnectionError, OSError):
+                if activity is not None:
+                    activity.delivered(n)
+        except asyncio.CancelledError:
             return
+        except (ConnectionError, OSError) as exc:
+            close_reason = f"upstream: {type(exc).__name__}"
+        except asyncio.IncompleteReadError:
+            close_reason = "upstream: tcp_reset"
         except Exception as exc:
+            close_reason = f"upstream: {type(exc).__name__}: {exc}"
             log.debug("[%s] ws->tcp ended: %s", label, exc)
 
     tasks = [
@@ -212,10 +247,13 @@ async def bridge_ws(
             except BaseException:
                 pass
         elapsed = asyncio.get_running_loop().time() - start
+        if activity is not None:
+            activity.close()
         log.info(
-            "[%s] %s WS closed: ^%s (%d) v%s (%d) in %.1fs",
+            "[%s] %s WS closed (%s): ^%s (%d) v%s (%d) in %.1fs",
             label,
             dc_tag,
+            close_reason,
             human_bytes(up_bytes),
             up_packets,
             human_bytes(down_bytes),

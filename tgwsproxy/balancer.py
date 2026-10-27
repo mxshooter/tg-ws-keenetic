@@ -15,20 +15,20 @@ class DomainBalancer:
         self.domains: List[str] = []
         self._active: Dict[int, str] = {}
 
-    def update_pool(self, domains: List[str]) -> None:
+    def update_domains_list(self, domains: List[str]) -> None:
         if Counter(self.domains) == Counter(domains):
             return
         self.domains = list(domains)
         self._active = {dc: random.choice(self.domains) for dc in DC_IDS}
 
-    def promote(self, dc_id: int, domain: str) -> bool:
-        """Pin `domain` as the preferred one for `dc_id`. Returns True if it changed."""
+    def update_domain_for_dc(self, dc_id: int, domain: str) -> bool:
+        """Pin `domain` as the preferred one for `dc_id`. Returns True if changed."""
         if self._active.get(dc_id) == domain:
             return False
         self._active[dc_id] = domain
         return True
 
-    def candidates_for(self, dc_id: int) -> Iterator[str]:
+    def get_domains_for_dc(self, dc_id: int) -> Iterator[str]:
         """Yield active first, then the rest in random order."""
         active = self._active.get(dc_id)
         if active is not None:

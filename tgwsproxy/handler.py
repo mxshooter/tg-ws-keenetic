@@ -1,11 +1,11 @@
 """Per-connection MTProto handler.
 
-Each accepted TCP connection goes through `handle_client`:
+Each accepted TCP connection goes through `handle`:
   1. Read PROXY-protocol line if enabled.
   2. Read the first byte to decide between Fake TLS and raw obfuscated MTP.
   3. Run Fake TLS handshake (if applicable) and unwrap the inner stream.
   4. Authenticate the MTProto obfuscation handshake using the secret.
-  5. Try WSS to the matching DC; fall back to CF/TCP if needed.
+  5. Take a WS connection from the pool, or fall back to CF/TCP.
   6. Bridge the rest of the connection.
 """
 from __future__ import annotations
@@ -13,9 +13,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import struct
-import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Set
+from typing import Dict, Optional
 
 from .bridge import MessageSplitter, bridge_ws
 from .crypto import (
@@ -32,20 +31,11 @@ from .fake_tls import (
 )
 from .fallback import FallbackConfig, attempt_fallback
 from .stats import Stats
-from .websocket import RawWebSocket, WsHandshakeError, apply_socket_options
+from .websocket import apply_socket_options
 from .ws_pool import WebSocketPool, ws_domains_for
-from .constants import (
-    HANDSHAKE_LEN,
-    TLS_RECORD_HANDSHAKE,
-    WS_PATH,
-    WS_PATH_TEST,
-)
+from .constants import HANDSHAKE_LEN, TLS_RECORD_HANDSHAKE
 
 log = logging.getLogger("tgwsproxy.handler")
-
-DC_FAIL_COOLDOWN = 30.0
-WS_FAST_FAIL_TIMEOUT = 2.0
-WS_DEFAULT_TIMEOUT = 10.0
 
 
 @dataclass
@@ -61,49 +51,23 @@ class HandlerSettings:
     fallback: FallbackConfig
 
 
-class _CooldownTracker:
-    """Remembers recent failures so we can short-circuit retries."""
-
-    def __init__(self) -> None:
-        self.blacklist: Set[str] = set()
-        self.fail_until: Dict[str, float] = {}
-
-    def reset(self) -> None:
-        self.blacklist.clear()
-        self.fail_until.clear()
-
-    def is_blacklisted(self, key: str) -> bool:
-        return key in self.blacklist
-
-    def add_blacklist(self, key: str) -> None:
-        self.blacklist.add(key)
-
-    def remaining_cooldown(self, key: str) -> float:
-        return max(0.0, self.fail_until.get(key, 0.0) - time.monotonic())
-
-    def cooldown(self, key: str) -> None:
-        self.fail_until[key] = time.monotonic() + DC_FAIL_COOLDOWN
-
-    def clear(self, key: str) -> None:
-        self.fail_until.pop(key, None)
-
-
 class ClientHandler:
-    """Holds the per-server state (pool, cooldowns) and serves clients."""
+    """Holds the per-server state (pool) and serves clients."""
 
     def __init__(
         self,
         settings: HandlerSettings,
         pool: WebSocketPool,
         stats: Stats,
+        h2_pool=None,
     ):
         self._settings = settings
         self._pool = pool
         self._stats = stats
-        self._cooldown = _CooldownTracker()
+        self._h2_pool = h2_pool
 
-    def reset(self) -> None:
-        self._cooldown.reset()
+    def set_h2_pool(self, h2_pool) -> None:
+        self._h2_pool = h2_pool
 
     async def handle(
         self,
@@ -271,15 +235,13 @@ class ClientHandler:
     ) -> None:
         dc, is_media = parsed.dc_id, parsed.is_media
         proto_int = parsed.proto_int
-        media_tag = " media" if is_media else ""
 
         is_test_dc = self._settings.force_test_dc or dc >= 10000
         if dc >= 10000:
             log.info("[%s] test DC%d -> DC%d", label, dc, dc - 10000)
             dc -= 10000
 
-        dc_key = f"{dc}{'t' if is_test_dc else ''}{'m' if is_media else ''}"
-        ws_path = WS_PATH_TEST if is_test_dc else WS_PATH
+        media_tag = " media" if is_media else ""
 
         log.debug(
             "[%s] handshake ok DC%d%s proto=0x%08X",
@@ -289,21 +251,21 @@ class ClientHandler:
         relay_init = generate_relay_handshake(parsed.proto_tag, parsed.dc_index)
         ctx = build_context(parsed.prekey_iv, self._settings.secret, relay_init)
 
-        # No route for this DC at all? -> fallback only.
-        if (
-            dc not in self._settings.dc_redirects
-            or self._cooldown.is_blacklisted(dc_key)
-        ):
-            reason = (
-                "no DC route" if dc not in self._settings.dc_redirects
-                else "DC blacklisted"
-            )
-            log.info("[%s] DC%d%s %s -> fallback", label, dc, media_tag, reason)
+        # Everything goes through the pool now (direct connections were
+        # removed upstream). If the pool has nothing, fall back.
+        ws = await self._pool.acquire(
+            dc, is_media, self._settings.dc_redirects.get(dc, ""),
+            ws_domains_for(dc, is_media), is_test_dc=is_test_dc,
+        )
+        if ws is None:
+            log.info("[%s] DC%d%s WS pool unavailable -> fallback",
+                     label, dc, media_tag)
             splitter = _safe_splitter(proto_int)
             if not await attempt_fallback(
                 reader, writer, relay_init, label, dc, is_media, ctx,
                 self._stats, self._settings.fallback, splitter,
-                is_test_dc=is_test_dc,
+                is_test_dc=is_test_dc, h2_pool=self._h2_pool,
+                proto_tag=parsed.proto_tag,
             ):
                 log.warning(
                     "[%s] DC%d%s no fallback available",
@@ -311,71 +273,7 @@ class ClientHandler:
                 )
             return
 
-        # Try the WS pool first, then a fresh connect. Test DCs are never
-        # pooled — they use the dedicated /apiws_test endpoint instead.
-        target_ip = self._settings.dc_redirects[dc]
-        domains = ws_domains_for(dc, is_media)
-        timeout = (
-            WS_FAST_FAIL_TIMEOUT
-            if self._cooldown.remaining_cooldown(dc_key) > 0
-            else WS_DEFAULT_TIMEOUT
-        )
-
-        ws = None if is_test_dc else await self._pool.acquire(
-            dc, is_media, target_ip, domains
-        )
-        ws_redirect_only = True
-
-        if ws is not None:
-            log.info("[%s] DC%d%s -> pool hit via %s",
-                     label, dc, media_tag, target_ip)
-        else:
-            for domain in domains:
-                log.info(
-                    "[%s] DC%d%s -> %s via %s",
-                    label, dc, media_tag, ws_path, target_ip,
-                )
-                try:
-                    ws = await RawWebSocket.connect(
-                        target_ip, domain, timeout=timeout,
-                        path=ws_path,
-                        buffer_size=self._settings.buffer_size,
-                    )
-                    ws_redirect_only = False
-                    break
-                except WsHandshakeError as exc:
-                    self._stats.ws_errors += 1
-                    if exc.is_redirect:
-                        log.warning(
-                            "[%s] DC%d%s %d from %s -> %s",
-                            label, dc, media_tag, exc.status_code, domain,
-                            exc.location or "?",
-                        )
-                        continue
-                    ws_redirect_only = False
-                    log.warning(
-                        "[%s] DC%d%s WS handshake: %s",
-                        label, dc, media_tag, exc.status_line,
-                    )
-                except Exception as exc:
-                    self._stats.ws_errors += 1
-                    ws_redirect_only = False
-                    log.warning(
-                        "[%s] DC%d%s WS connect failed: %r",
-                        label, dc, media_tag, exc,
-                    )
-
-        if ws is None:
-            self._record_ws_failure(dc_key, ws_redirect_only, label, media_tag, dc)
-            splitter = _safe_splitter(proto_int)
-            await attempt_fallback(
-                reader, writer, relay_init, label, dc, is_media, ctx,
-                self._stats, self._settings.fallback, splitter,
-                is_test_dc=is_test_dc,
-            )
-            return
-
-        self._cooldown.clear(dc_key)
+        log.info("[%s] DC%d%s -> WS pool hit", label, dc, media_tag)
         self._stats.connections_ws += 1
 
         splitter = _safe_splitter(proto_int)
@@ -384,23 +282,6 @@ class ClientHandler:
             reader, writer, ws, label, ctx, self._stats,
             dc=dc, is_media=is_media, splitter=splitter,
         )
-
-    def _record_ws_failure(
-        self, dc_key: str, redirect_only: bool, label: str,
-        media_tag: str, dc: int,
-    ) -> None:
-        if redirect_only:
-            self._cooldown.add_blacklist(dc_key)
-            log.warning(
-                "[%s] DC%d%s blacklisted for WS (all redirects)",
-                label, dc, media_tag,
-            )
-        else:
-            self._cooldown.cooldown(dc_key)
-            log.info(
-                "[%s] DC%d%s WS cooldown for %ds",
-                label, dc, media_tag, int(DC_FAIL_COOLDOWN),
-            )
 
 
 def _safe_splitter(proto_int: int) -> Optional[MessageSplitter]:
