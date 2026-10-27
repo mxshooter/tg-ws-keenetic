@@ -30,6 +30,7 @@ RESERVED_STARTS = {
     b"\xee\xee\xee\xee",
     b"\xdd\xdd\xdd\xdd",
     b"\x16\x03\x01\x02",  # TLS record header
+    b"\x4f\x50\x54\x49",  # "OPTI"
 }
 RESERVED_CONTINUE = b"\x00\x00\x00\x00"
 

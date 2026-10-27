@@ -38,13 +38,15 @@ opkg install python3 python3-cryptography git
 ```
 
 > `python3-cryptography` тянет нативный C-модуль с AES — на ARM она
-> работает быстро. Без неё не запустится.
+> работает быстро. Если её нет (или собирать тяжело), прокси использует
+> системный `libcrypto` (OpenSSL) через `ctypes`:
+> `opkg install libopenssl`. Достаточно одного из двух бэкендов.
 
-Проверка:
+Проверка (любая из команд; хотя бы одна должна сработать):
 
 ```sh
 python3 -c "import cryptography; print(cryptography.__version__)"
-# Должна вывести версию, например: 41.0.3
+python3 -c "import ctypes, ctypes.util; ctypes.CDLL(ctypes.util.find_library('crypto') or 'libcrypto.so'); print('libcrypto ok')"
 ```
 
 ## 2. Получение кода
@@ -73,7 +75,7 @@ sh scripts/install.sh
 
 Что произойдёт:
 
-1. Проверится наличие `python3` и `python3-cryptography`.
+1. Проверится наличие `python3` и доступного AES-бэкенда (`cryptography` или `libcrypto`).
 2. Создадутся каталоги:
    - `/opt/share/tgwsproxy/` (код)
    - `/opt/etc/tgwsproxy/` (конфиг)
@@ -119,7 +121,8 @@ tail -n 50 /opt/var/log/tgwsproxy/tgwsproxy.log
 
 | Сообщение | Что значит | Что делать |
 |---|---|---|
-| `ModuleNotFoundError: No module named 'cryptography'` | пакет не установлен | `opkg install python3-cryptography` |
+| `ModuleNotFoundError: No module named 'cryptography'` | нет `cryptography` (не критично, если есть `libcrypto`) | `opkg install python3-cryptography` |
+| `libcrypto not found` | нет ни `cryptography`, ни системного OpenSSL | `opkg install python3-cryptography` или `opkg install libopenssl` |
 | `OSError: [Errno 98] Address already in use` | порт 1433/1434 занят | измените порт в `config.json` |
 | `Cannot persist config to ...: Read-only file system` | не примонтирован `/opt` | проверьте USB-накопитель |
 

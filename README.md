@@ -26,7 +26,7 @@ Telegram MTProto → WebSocket прокси, который запускаетс
 | Конфиг | `/opt/etc/tgwsproxy/config.json` | редактируется через web UI |
 | Логи | `/opt/var/log/tgwsproxy/` | с авто-ротацией |
 | Код | `/opt/share/tgwsproxy/` | обновляется через `scripts/install.sh` |
-| Зависимости | `python3`, `python3-cryptography` | оба ставятся через `opkg` |
+| Зависимости | `python3` (+ любой AES-бэкенд: `python3-cryptography` или системный `libcrypto`) | ставятся через `opkg` |
 
 ## Установка
 
@@ -36,6 +36,8 @@ Telegram MTProto → WebSocket прокси, который запускаетс
 # 1) Зависимости (если ещё не стоят)
 opkg update
 opkg install python3 python3-cryptography git
+# Если python3-cryptography нет/собирать тяжело — AES возьмётся из libcrypto:
+#   opkg install libopenssl
 
 # 2) Получить код
 cd /opt/tmp
@@ -48,7 +50,7 @@ sh scripts/install.sh
 
 Скрипт:
 
-1. Проверит, что Python и `cryptography` установлены.
+1. Проверит, что Python и доступен AES-бэкенд (`cryptography` или `libcrypto`).
 2. Скопирует код в `/opt/share/tgwsproxy/`.
 3. Положит init-скрипт в `/opt/etc/init.d/S99tgwsproxy`.
 4. Сгенерирует дефолтный `config.json` (с уникальным secret), если его нет.
@@ -146,7 +148,10 @@ sh scripts/uninstall.sh --purge   # снести всё
 ## Совместимость
 
 - **Архитектура**: ARM (тестировано на Keenetic с Cortex-A53), MIPS теоретически
-  тоже работает, но AES-CTR через `python3-cryptography` будет заметно медленнее.
+  тоже работает, но AES-CTR на слабом CPU будет заметно медленнее.
+- **AES-бэкенд**: `python3-cryptography`, а при его отсутствии — системный
+  `libcrypto` (OpenSSL) через `ctypes`; отдельный пакет `cryptography` не
+  обязателен.
 - **Минимум RAM**: ≈ 30 MB на процесс при `pool_size=4`.
 - **Python**: 3.9+ (Entware на момент написания даёт 3.11).
 

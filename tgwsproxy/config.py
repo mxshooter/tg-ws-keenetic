@@ -14,19 +14,32 @@ import copy
 import json
 import logging
 import os
+import random
 import secrets
 import socket as _socket
+import string
+import threading
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
+
+from .balancer import balancer
 
 log = logging.getLogger("tgwsproxy.config")
 
 DEFAULT_CONFIG_PATH = "/opt/etc/tgwsproxy/config.json"
 DEFAULT_LOG_PATH = "/opt/var/log/tgwsproxy/tgwsproxy.log"
 
-# CF proxy fallback default pool (encoded). See balancer.py for the decoder
-# applied at load time. Encoded so a casual scan of the binary doesn't list
-# fallback infrastructure.
+# Upstream CF-proxy domain list is refreshed from this file periodically.
+CFPROXY_DOMAINS_URL = (
+    "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main"
+    "/.github/cfproxy-domains.txt"
+)
+_CFPROXY_MIN_VALID_DOMAINS = 3
+
+# CF proxy fallback default pool (encoded). See _decode_cfproxy for the
+# decoder applied at load time. Encoded so a casual scan of the source
+# doesn't list the fallback infrastructure.
 _CFPROXY_ENCODED_DEFAULTS: List[str] = [
     "virkgj.com",
     "vmmzovy.com",
@@ -38,6 +51,16 @@ _CFPROXY_ENCODED_DEFAULTS: List[str] = [
     "tjacxbqtj.com",
     "bxaxtxmrw.com",
     "dmohrsgmohcrwb.com",
+    "vwbmtmoi.com",
+    "khgrre.com",
+    "ulihssf.com",
+    "tmhqsdqmfpmk.com",
+    "xwuwoqbm.com",
+    "orgcnunpj.com",
+    "zhkuldz.com",
+    "zypoljnslxa.com",
+    "efabnxaowuzs.com",
+    "zaftuzsftqdq.com",
 ]
 _TLD = "".join(chr(c) for c in (46, 99, 111, 46, 117, 107))
 
@@ -55,6 +78,113 @@ def _decode_cfproxy(label: str) -> str:
         else:
             out.append(ch)
     return "".join(out) + _TLD
+
+
+CFPROXY_DEFAULT_DOMAINS: List[str] = [
+    _decode_cfproxy(d) for d in _CFPROXY_ENCODED_DEFAULTS
+]
+
+
+def _is_valid_domain(domain: str) -> bool:
+    if not domain or len(domain) > 253:
+        return False
+    if domain.startswith(".") or domain.endswith("."):
+        return False
+    labels = domain.split(".")
+    if len(labels) < 2:
+        return False
+    for label in labels:
+        if not label or len(label) > 63:
+            return False
+        if label[0] == "-" or label[-1] == "-":
+            return False
+        if not all(ch.isalnum() or ch == "-" for ch in label):
+            return False
+    tld = labels[-1]
+    if len(tld) < 2 or not any(ch.isalpha() for ch in tld):
+        return False
+    return True
+
+
+def _normalize_domain_pool(domains: List[str]) -> List[str]:
+    seen = set()
+    normalized: List[str] = []
+    for domain in domains:
+        item = domain.strip().lower()
+        if not _is_valid_domain(item) or item in seen:
+            continue
+        seen.add(item)
+        normalized.append(item)
+    return normalized
+
+
+def _fetch_cfproxy_domain_list(user_overridden: bool) -> List[str]:
+    if user_overridden:
+        return []
+    try:
+        url = CFPROXY_DOMAINS_URL + "?" + "".join(
+            random.choices(string.ascii_letters, k=7)
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "tg-ws-keenetic"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+        encoded = [
+            line.strip() for line in text.splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        return [_decode_cfproxy(d) for d in encoded]
+    except Exception as exc:
+        log.warning("Failed to fetch CF proxy domain list: %s", repr(exc))
+        return []
+
+
+def refresh_cfproxy_domains(user_overridden: bool = False) -> None:
+    """Pull the latest CF-proxy domain pool from GitHub, if not overridden."""
+    if user_overridden:
+        return
+    fetched = _fetch_cfproxy_domain_list(user_overridden=False)
+    pool = _normalize_domain_pool(fetched)
+    if len(pool) >= _CFPROXY_MIN_VALID_DOMAINS:
+        balancer.update_pool(pool)
+        log.info("CF proxy domain pool updated from GitHub (%d domains)", len(pool))
+        return
+    if fetched:
+        log.warning(
+            "Ignoring fetched CF proxy domains (total=%d, valid=%d, required>=%d); "
+            "keeping current pool",
+            len(fetched), len(pool), _CFPROXY_MIN_VALID_DOMAINS,
+        )
+    else:
+        log.warning(
+            "CF proxy domain refresh failed or empty; keeping current pool"
+        )
+
+
+_refresh_stop = threading.Event()
+
+
+def start_cfproxy_domain_refresh(user_overridden: bool = False) -> None:
+    """Seed the balancer and start the hourly GitHub refresh thread."""
+    global _refresh_stop
+    _refresh_stop.set()
+    _refresh_stop = threading.Event()
+    stop = _refresh_stop
+
+    if not user_overridden:
+        balancer.update_pool(CFPROXY_DEFAULT_DOMAINS)
+
+    def _loop():
+        refresh_cfproxy_domains(user_overridden)
+        while not stop.wait(timeout=3600):
+            refresh_cfproxy_domains(user_overridden)
+
+    threading.Thread(
+        target=_loop, daemon=True, name="cfproxy-domains-refresh"
+    ).start()
+
+
+def stop_cfproxy_domain_refresh() -> None:
+    _refresh_stop.set()
 
 
 @dataclass
@@ -116,7 +246,7 @@ class Config:
             self.secret = secrets.token_hex(16)
 
     def cfproxy_default_pool(self) -> List[str]:
-        return [_decode_cfproxy(d) for d in _CFPROXY_ENCODED_DEFAULTS]
+        return list(CFPROXY_DEFAULT_DOMAINS)
 
     def validate(self) -> List[str]:
         """Return a list of human-readable errors. Empty list = OK."""

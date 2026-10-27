@@ -35,7 +35,6 @@ from .stats import Stats
 from .websocket import RawWebSocket, WsHandshakeError, apply_socket_options
 from .ws_pool import WebSocketPool, ws_domains_for
 from .constants import (
-    DC_TEST_IPS,
     HANDSHAKE_LEN,
     TLS_RECORD_HANDSHAKE,
     WS_PATH,
@@ -300,7 +299,7 @@ class ClientHandler:
                 else "DC blacklisted"
             )
             log.info("[%s] DC%d%s %s -> fallback", label, dc, media_tag, reason)
-            splitter = _safe_splitter(relay_init, proto_int)
+            splitter = _safe_splitter(proto_int)
             if not await attempt_fallback(
                 reader, writer, relay_init, label, dc, is_media, ctx,
                 self._stats, self._settings.fallback, splitter,
@@ -326,7 +325,6 @@ class ClientHandler:
             dc, is_media, target_ip, domains
         )
         ws_redirect_only = True
-        ws_failed = ws is None
 
         if ws is not None:
             log.info("[%s] DC%d%s -> pool hit via %s",
@@ -343,7 +341,6 @@ class ClientHandler:
                         path=ws_path,
                         buffer_size=self._settings.buffer_size,
                     )
-                    ws_failed = False
                     ws_redirect_only = False
                     break
                 except WsHandshakeError as exc:
@@ -370,7 +367,7 @@ class ClientHandler:
 
         if ws is None:
             self._record_ws_failure(dc_key, ws_redirect_only, label, media_tag, dc)
-            splitter = _safe_splitter(relay_init, proto_int)
+            splitter = _safe_splitter(proto_int)
             await attempt_fallback(
                 reader, writer, relay_init, label, dc, is_media, ctx,
                 self._stats, self._settings.fallback, splitter,
@@ -381,7 +378,7 @@ class ClientHandler:
         self._cooldown.clear(dc_key)
         self._stats.connections_ws += 1
 
-        splitter = _safe_splitter(relay_init, proto_int)
+        splitter = _safe_splitter(proto_int)
         await ws.send(relay_init)
         await bridge_ws(
             reader, writer, ws, label, ctx, self._stats,
@@ -406,9 +403,9 @@ class ClientHandler:
             )
 
 
-def _safe_splitter(relay_init: bytes, proto_int: int) -> Optional[MessageSplitter]:
+def _safe_splitter(proto_int: int) -> Optional[MessageSplitter]:
     try:
-        return MessageSplitter(relay_init, proto_int)
+        return MessageSplitter(proto_int)
     except Exception:
         return None
 
