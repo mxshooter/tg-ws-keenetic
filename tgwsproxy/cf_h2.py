@@ -943,7 +943,7 @@ class CfH2Pool:
 async def bridge_h2(reader, writer, channel: _HttpChannel, ctx, tag: bytes) -> None:
     async def write_native(data):
         try:
-            writer.write(ctx.clt_enc.update(data))
+            writer.write(ctx.client_encrypt.update(data))
             await writer.drain()
         except OSError as exc:
             raise _NativeDeliveryError(str(exc)) from exc
@@ -951,7 +951,7 @@ async def bridge_h2(reader, writer, channel: _HttpChannel, ctx, tag: bytes) -> N
     async def upload() -> None:
         while True:
             try:
-                body, quick = await _read_packet(reader, ctx.clt_dec, tag)
+                body, quick = await _read_packet(reader, ctx.client_decrypt, tag)
             except OSError as exc:
                 raise _NativeDeliveryError(str(exc)) from exc
             await channel.send(body, quick)
