@@ -43,9 +43,28 @@ _UNPACK_Q = struct.Struct(">Q")
 # of building big integers, which is markedly faster on slow router CPUs.
 _XOR_TABLES = tuple(bytes(value ^ key for value in range(256)) for key in range(256))
 
-_SSL_CTX = ssl.create_default_context()
-_SSL_CTX.check_hostname = False
-_SSL_CTX.verify_mode = ssl.CERT_NONE
+
+def create_ssl_context(
+    *, check_hostname: bool = False, verify: bool = False
+) -> ssl.SSLContext:
+    """Build an SSL context.
+
+    Keenetic/Entware boxes rarely ship an up-to-date CA bundle, so certificate
+    verification is disabled by default (matching the fork's historic
+    behaviour). Callers that need a verified context (e.g. HTTP/2 to
+    Cloudflare) can pass ``verify=True``.
+    """
+    context = ssl.create_default_context()
+    if verify:
+        context.check_hostname = check_hostname
+    else:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+_SSL_CTX = create_ssl_context()
+_SSL_CTX_FRONTING = create_ssl_context()
 
 
 class WsHandshakeError(Exception):
@@ -144,12 +163,18 @@ class RawWebSocket:
         buffer_size: int = 256 * 1024,
         *,
         sni: Optional[str] = None,
+        secure: bool = True,
     ) -> "RawWebSocket":
+        ssl_context = _SSL_CTX_FRONTING if sni else _SSL_CTX
         if sni is None:
             sni = sni_domain
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(
-                host, 443, ssl=_SSL_CTX, server_hostname=sni
+            (
+                asyncio.open_connection(
+                    host, 443, ssl=ssl_context, server_hostname=sni
+                )
+                if secure
+                else asyncio.open_connection(host, 80)
             ),
             timeout=min(timeout, 10),
         )
@@ -166,14 +191,21 @@ class RawWebSocket:
             f"Sec-WebSocket-Protocol: binary\r\n"
             f"\r\n"
         )
-        writer.write(request.encode())
-        await writer.drain()
+        try:
+            writer.write(request.encode())
+            await writer.drain()
 
-        status_code, status_line, headers = await cls._read_response(
-            reader, timeout
-        )
-        if status_code == 101:
-            return cls(reader, writer)
+            status_code, status_line, headers = await cls._read_response(
+                reader, timeout
+            )
+            if status_code == 101:
+                return cls(reader, writer)
+        except BaseException:
+            try:
+                writer.close()
+            except Exception:
+                pass
+            raise
 
         try:
             writer.close()

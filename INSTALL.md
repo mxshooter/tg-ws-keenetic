@@ -49,6 +49,18 @@ python3 -c "import cryptography; print(cryptography.__version__)"
 python3 -c "import ctypes, ctypes.util; ctypes.CDLL(ctypes.util.find_library('crypto') or 'libcrypto.so'); print('libcrypto ok')"
 ```
 
+> **Опционально: HTTP/2-медиа.** Для мультиплексирования медиа-трафика через
+> Cloudflare понадобятся `httpx` и `h2`:
+>
+> ```sh
+> opkg install python3-httpx python3-h2
+> # либо: pip3 install 'httpx[http2]'
+> ```
+>
+> Если их нет — прокси работает как обычно (медиа пойдёт через WebSocket),
+> ничего не ломается. По умолчанию HTTP/2 включён (`cfproxy_h2_media: true`),
+> но применяется только когда оба пакета доступны и CF-фоллбэк включён.
+
 ## 2. Получение кода
 
 Вариант А — клонировать репозиторий:

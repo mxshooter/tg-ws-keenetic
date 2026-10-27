@@ -17,6 +17,10 @@ class Stats:
     connections_total: int = 0
     connections_active: int = 0
     connections_ws: int = 0
+    connections_h2: int = 0
+    h2_tcp_connections: int = 0
+    h2_requests: int = 0
+    h2_errors: int = 0
     connections_tcp_fallback: int = 0
     connections_cfproxy: int = 0
     connections_fronting: int = 0
@@ -40,6 +44,7 @@ class Stats:
             f"total={self.connections_total} "
             f"active={self.connections_active} "
             f"ws={self.connections_ws} "
+            f"h2={self.connections_h2} "
             f"tcp_fb={self.connections_tcp_fallback} "
             f"cf={self.connections_cfproxy} "
             f"front={self.connections_fronting} "
@@ -58,6 +63,7 @@ class Stats:
                 "total": self.connections_total,
                 "active": self.connections_active,
                 "ws": self.connections_ws,
+                "h2": self.connections_h2,
                 "tcp_fallback": self.connections_tcp_fallback,
                 "cfproxy": self.connections_cfproxy,
                 "fronting": self.connections_fronting,
@@ -76,6 +82,11 @@ class Stats:
                 "pool_misses": self.pool_misses,
                 "cf_pool_hits": self.cf_pool_hits,
                 "cf_pool_misses": self.cf_pool_misses,
+            },
+            "h2": {
+                "tcp_connections": self.h2_tcp_connections,
+                "requests": self.h2_requests,
+                "errors": self.h2_errors,
             },
             "started_at": self.started_at,
         }

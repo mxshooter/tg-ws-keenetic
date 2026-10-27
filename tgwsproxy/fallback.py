@@ -76,11 +76,17 @@ tcp_backoff = _TcpBackoff()
 class FallbackConfig:
     """Bundles the few flags that influence fallback selection."""
 
-    __slots__ = ("cfproxy_enabled", "cfproxy_worker_domain")
+    __slots__ = ("cfproxy_enabled", "cfproxy_worker_domain", "disable_secure")
 
-    def __init__(self, cfproxy_enabled: bool, cfproxy_worker_domain: str):
+    def __init__(
+        self,
+        cfproxy_enabled: bool,
+        cfproxy_worker_domain: str,
+        disable_secure: bool = False,
+    ):
         self.cfproxy_enabled = cfproxy_enabled
         self.cfproxy_worker_domain = cfproxy_worker_domain
+        self.disable_secure = disable_secure
 
 
 async def attempt_fallback(
@@ -95,6 +101,8 @@ async def attempt_fallback(
     cfg: FallbackConfig,
     splitter: Optional[MessageSplitter] = None,
     is_test_dc: bool = False,
+    h2_pool=None,
+    proto_tag: Optional[bytes] = None,
 ) -> bool:
     """Try each enabled fallback in order. Returns True if one took over."""
     ip_table = DC_TEST_IPS if is_test_dc else DC_DEFAULT_IPS
@@ -118,6 +126,16 @@ async def attempt_fallback(
             return True
 
     if cfg.cfproxy_enabled and not is_test_dc:
+        # Media traffic can be multiplexed over HTTP/2 to the CF proxy, which
+        # is far cheaper than one WS connection per stream.
+        if is_media and h2_pool is not None and proto_tag is not None:
+            channel = await h2_pool.open(dc, label)
+            if channel is not None:
+                stats.connections_h2 += 1
+                stats.connections_cfproxy += 1
+                from .cf_h2 import bridge_h2
+                await bridge_h2(client_reader, client_writer, channel, ctx, proto_tag)
+                return True
         if await _cfproxy(
             client_reader,
             client_writer,
@@ -127,6 +145,7 @@ async def attempt_fallback(
             is_media,
             ctx,
             stats,
+            cfg,
             splitter,
         ):
             return True
@@ -163,6 +182,7 @@ async def _cfworker(
 ) -> bool:
     media_tag = " media" if is_media else ""
     worker_domains = [cfg.cfproxy_worker_domain]
+    secure = not cfg.disable_secure
 
     pooled = await cf_worker_pool.acquire(dc, target_ip, worker_domains)
     if pooled is not None:
@@ -178,7 +198,8 @@ async def _cfworker(
                      label, dc, media_tag, worker_domain, target_ip)
             try:
                 ws = await RawWebSocket.connect(
-                    worker_domain, worker_domain, timeout=10.0, path=path
+                    worker_domain, worker_domain, timeout=10.0, path=path,
+                    secure=secure,
                 )
                 break
             except Exception as exc:
@@ -207,6 +228,7 @@ async def _cfproxy(
     is_media,
     ctx,
     stats,
+    cfg,
     splitter,
 ) -> bool:
     media_tag = " media" if is_media else ""
@@ -214,10 +236,13 @@ async def _cfproxy(
 
     ws = None
     chosen = None
-    for base in balancer.candidates_for(dc):
+    for base in balancer.get_domains_for_dc(dc):
         domain = f"kws{dc}.{base}"
         try:
-            ws = await RawWebSocket.connect(domain, domain, timeout=10.0)
+            ws = await RawWebSocket.connect(
+                domain, domain, timeout=10.0,
+                secure=not cfg.disable_secure,
+            )
             chosen = base
             break
         except Exception as exc:
@@ -227,7 +252,7 @@ async def _cfproxy(
     if ws is None:
         return False
 
-    if chosen and balancer.promote(dc, chosen):
+    if chosen and balancer.update_domain_for_dc(dc, chosen):
         log.info("[%s] active CF domain for DC%d -> %s", label, dc, chosen)
 
     stats.connections_cfproxy += 1

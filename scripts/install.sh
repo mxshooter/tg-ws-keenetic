@@ -44,6 +44,15 @@ else
     die "No AES backend. Install python3-cryptography or libopenssl: opkg install python3-cryptography"
 fi
 
+# HTTP/2 media multiplexing is optional: it needs httpx + h2. Without them the
+# proxy still works, just without the (cheaper) HTTP/2 path for media.
+if "$PYTHON_BIN" -c 'import httpx, h2' >/dev/null 2>&1; then
+    ok "httpx + h2 present: HTTP/2 media multiplexing available"
+else
+    warn "httpx/h2 missing: HTTP/2 media disabled (WS fallback still works)."
+    warn "  To enable: pip3 install 'httpx[http2]' (or opkg install python3-httpx python3-h2)"
+fi
+
 bold "Creating directories..."
 mkdir -p "$INSTALL_ROOT" "$CONFIG_DIR" "$LOG_DIR" "$RUN_DIR"
 ok "Directories ready"

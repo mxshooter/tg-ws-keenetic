@@ -18,12 +18,13 @@ import time
 from collections import deque
 from typing import Deque, Dict, List, Optional, Set, Tuple
 
+from .constants import WS_PATH, WS_PATH_TEST
 from .stats import Stats, stats
 from .websocket import RawWebSocket, WsHandshakeError
 
 log = logging.getLogger("tgwsproxy.ws_pool")
 
-PoolKey = Tuple[int, bool]
+PoolKey = Tuple[int, bool, bool]
 
 
 def ws_domains_for(dc: int, is_media: Optional[bool]) -> List[str]:
@@ -66,9 +67,14 @@ class WebSocketPool:
         self._target = max(0, size)
 
     async def acquire(
-        self, dc: int, is_media: bool, target_ip: str, domains: List[str]
+        self,
+        dc: int,
+        is_media: bool,
+        target_ip: str,
+        domains: List[str],
+        is_test_dc: bool = False,
     ) -> Optional[RawWebSocket]:
-        key = (dc, is_media)
+        key = (dc, is_media, is_test_dc)
         bucket = self._idle.setdefault(key, deque())
         now = time.monotonic()
 
@@ -94,7 +100,7 @@ class WebSocketPool:
                 continue
             for is_media in (False, True):
                 self._schedule_refill(
-                    (dc, is_media), target_ip, ws_domains_for(dc, is_media)
+                    (dc, is_media, False), target_ip, ws_domains_for(dc, is_media)
                 )
         log.info("WS pool warmup started for %d DC(s)", len(dc_to_ip))
 
@@ -116,6 +122,11 @@ class WebSocketPool:
         self._refill_after.clear()
         self._try_fronting_first = False
 
+    async def close(self) -> None:
+        tasks = list(self._rotating.values()) + list(self._refilling.values())
+        self.reset()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     def _schedule_refill(
         self, key: PoolKey, target_ip: str, domains: List[str]
     ) -> None:
@@ -134,7 +145,7 @@ class WebSocketPool:
     async def _refill(
         self, key: PoolKey, target_ip: str, domains: List[str]
     ) -> None:
-        dc, is_media = key
+        dc, is_media, is_test_dc = key
         tasks: List[asyncio.Task] = []
         adopted: Set[RawWebSocket] = set()
         try:
@@ -143,8 +154,9 @@ class WebSocketPool:
             if needed <= 0:
                 return
             connected = 0
+            path = WS_PATH_TEST if is_test_dc else WS_PATH
             tasks = [
-                asyncio.create_task(self._connect_one(target_ip, domains))
+                asyncio.create_task(self._connect_one(target_ip, domains, path))
                 for _ in range(needed)
             ]
             for task in asyncio.as_completed(tasks):
@@ -172,12 +184,13 @@ class WebSocketPool:
                 )
                 self._refill_after[key] = time.monotonic() + delay
                 log.info(
-                    "WS pool refill failed for DC%d%s, retry in %.0fs",
-                    dc, "m" if is_media else "", delay,
+                    "WS pool refill failed for DC%d%s%s, retry in %.0fs",
+                    dc, "t" if is_test_dc else "", "m" if is_media else "", delay,
                 )
             log.debug(
-                "WS pool refilled DC%d%s -> %d ready",
-                dc, "m" if is_media else "", len(bucket),
+                "WS pool refilled DC%d%s%s -> %d ready",
+                dc, "t" if is_test_dc else "", "m" if is_media else "",
+                len(bucket),
             )
         finally:
             for task in tasks:
@@ -206,7 +219,7 @@ class WebSocketPool:
     async def _rotate(
         self, key: PoolKey, target_ip: str, domains: List[str]
     ) -> None:
-        dc, is_media = key
+        dc, is_media, is_test_dc = key
         try:
             while self._target > 0:
                 bucket = self._idle.setdefault(key, deque())
@@ -225,8 +238,9 @@ class WebSocketPool:
                     for ws in expired:
                         asyncio.create_task(self._quiet_close(ws))
                     log.debug(
-                        "WS pool rotated DC%d%s: %d stale, %d ready",
-                        dc, "m" if is_media else "", len(expired), len(bucket),
+                        "WS pool rotated DC%d%s%s: %d stale, %d ready",
+                        dc, "t" if is_test_dc else "", "m" if is_media else "",
+                        len(expired), len(bucket),
                     )
 
                 if len(bucket) < self._target:
@@ -249,7 +263,7 @@ class WebSocketPool:
                 self._rotating.pop(key, None)
 
     async def _connect_one(
-        self, target_ip: str, domains: List[str]
+        self, target_ip: str, domains: List[str], path: str = WS_PATH
     ) -> Optional[RawWebSocket]:
         for domain in domains:
             modes = (True, False) if self._try_fronting_first else (False, True)
@@ -259,22 +273,23 @@ class WebSocketPool:
                         target_ip,
                         domain,
                         timeout=7 if fronted else 8,
+                        path=path,
                         buffer_size=self._buffer,
                         sni=self.FRONTING_SNI if fronted else None,
                     )
                 except Exception as exc:
                     self._stats.ws_errors += 1
                     log.debug(
-                        "WS pool connect %s via %s (fronting=%s): %r",
-                        domain, target_ip, fronted, exc,
+                        "WS pool connect %s%s via %s (fronting=%s): %r",
+                        domain, path, target_ip, fronted, exc,
                     )
                     continue
                 self._try_fronting_first = fronted
                 if fronted:
                     self._stats.connections_fronting += 1
                 log.debug(
-                    "WS pool connected %s via %s (fronting=%s)",
-                    domain, target_ip, fronted,
+                    "WS pool connected %s%s via %s (fronting=%s)",
+                    domain, path, target_ip, fronted,
                 )
                 return ws
         return None
@@ -340,6 +355,11 @@ class CfWorkerPool:
         self._idle.clear()
         self._refilling.clear()
         self._exhausted_until.clear()
+
+    async def close(self) -> None:
+        tasks = list(self._refilling.values())
+        self.reset()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     def _schedule_refill(
         self, dc: int, fallback_dst: str, worker_domains: List[str]

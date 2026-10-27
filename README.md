@@ -26,7 +26,7 @@ Telegram MTProto → WebSocket прокси, который запускаетс
 | Конфиг | `/opt/etc/tgwsproxy/config.json` | редактируется через web UI |
 | Логи | `/opt/var/log/tgwsproxy/` | с авто-ротацией |
 | Код | `/opt/share/tgwsproxy/` | обновляется через `scripts/install.sh` |
-| Зависимости | `python3` (+ любой AES-бэкенд: `python3-cryptography` или системный `libcrypto`) | ставятся через `opkg` |
+| Зависимости | `python3` (+ любой AES-бэкенд: `python3-cryptography` или системный `libcrypto`); опционально `python3-httpx` + `python3-h2` для HTTP/2-медиа | ставятся через `opkg`/`pip` |
 
 ## Установка
 
@@ -131,6 +131,8 @@ ssh -L 1434:127.0.0.1:1434 root@<router>
 | `cfproxy` | bool | Пытаться ли CF-проксированные домены при сбое прямого WS |
 | `cfproxy_user_domain` | str | Свой CF-домен (перебивает встроенный пул) |
 | `cfproxy_worker_domain` | str | Свой CF Worker URL (пробуется первым) |
+| `cfproxy_h2_media` | bool | Мультиплексировать медиа-трафик по HTTP/2 к CF (нужны `httpx`+`h2`) |
+| `disable_secure` | bool | CF-подключения по HTTP (порт 80) вместо TLS |
 | `fake_tls_domain` | str | SNI для Fake-TLS маскировки; пусто = выкл. |
 | `proxy_protocol` | bool | Принимать PROXY protocol v1 (если за nginx/haproxy) |
 | `force_test_dc` | bool | Форсировать ВСЕ соединения на Telegram TEST датацентры |
@@ -152,6 +154,9 @@ sh scripts/uninstall.sh --purge   # снести всё
 - **AES-бэкенд**: `python3-cryptography`, а при его отсутствии — системный
   `libcrypto` (OpenSSL) через `ctypes`; отдельный пакет `cryptography` не
   обязателен.
+- **HTTP/2-медиа** (опционально): для мультиплексирования медиа через CF
+  нужны `httpx[http2]` и `h2`. Если их нет — прокси автоматически работает
+  через WS, ничего не ломается.
 - **Минимум RAM**: ≈ 30 MB на процесс при `pool_size=4`.
 - **Python**: 3.9+ (Entware на момент написания даёт 3.11).
 

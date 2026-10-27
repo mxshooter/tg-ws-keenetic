@@ -78,6 +78,7 @@
             ['Всего соединений', c.total],
             ['Активные',         c.active],
             ['Через WebSocket',  c.ws],
+            ['Через HTTP/2',     c.h2],
             ['Через TCP fallback', c.tcp_fallback],
             ['Через Cloudflare', c.cfproxy],
             ['С SNI-фронтингом', c.fronting],

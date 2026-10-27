@@ -26,6 +26,21 @@ from .ws_pool import WebSocketPool, cf_worker_pool
 log = logging.getLogger("tgwsproxy.server")
 
 
+def _make_h2_pool(config: Config):
+    """Create the CF HTTP/2 media pool if enabled and httpx/h2 are present."""
+    if not config.h2_enabled:
+        return None
+    try:
+        from .cf_h2 import CfH2Pool
+    except ImportError as exc:
+        log.warning(
+            "HTTP/2 media multiplexing is enabled but httpx/h2 are not "
+            "installed (%s); falling back to WS for media", exc,
+        )
+        return None
+    return CfH2Pool()
+
+
 class ProxyServer:
     def __init__(self, config: Config):
         self._config = config
@@ -36,6 +51,8 @@ class ProxyServer:
         self._tasks: Set[asyncio.Task] = set()
         self._handler: Optional[ClientHandler] = None
         self._pool: Optional[WebSocketPool] = None
+        self._h2_pool = None
+        self._stopping = False
 
     @property
     def listening(self) -> bool:
@@ -59,22 +76,25 @@ class ProxyServer:
         self._stop_event = asyncio.Event()
 
         if self._config.cfproxy and not self._config.cfproxy_user_domain:
-            balancer.update_pool(self._config.cfproxy_default_pool())
+            balancer.update_domains_list(self._config.cfproxy_default_pool())
             start_cfproxy_domain_refresh(user_overridden=False)
         elif self._config.cfproxy_user_domain:
-            balancer.update_pool([self._config.cfproxy_user_domain])
+            balancer.update_domains_list([self._config.cfproxy_user_domain])
 
         tcp_backoff.reset()
+        self._stopping = False
 
         self._pool = WebSocketPool(
             target_size=self._config.pool_size,
             buffer_size=self._config.buffer_size,
             stats=stats,
         )
+        self._h2_pool = _make_h2_pool(self._config)
         self._handler = ClientHandler(
             settings=self._build_handler_settings(),
             pool=self._pool,
             stats=stats,
+            h2_pool=self._h2_pool,
         )
         stats.started_at = time.time()
 
@@ -92,6 +112,12 @@ class ProxyServer:
             log.info("    DC%d -> %s", dc, ip)
         if self._config.fake_tls_domain:
             log.info("  Fake TLS: %s", self._config.fake_tls_domain)
+        if self._config.cfproxy_worker_domain:
+            log.info("  CF worker: %s", self._config.cfproxy_worker_domain)
+        if self._h2_pool is not None:
+            log.info("  CF H2 media: enabled")
+        if self._config.disable_secure:
+            log.info("  No secure: enabled (port 80 for CF proxy/worker)")
         log.info("=" * 60)
 
         self._stats_task = asyncio.create_task(self._log_stats_loop())
@@ -112,6 +138,7 @@ class ProxyServer:
         if not self.listening:
             return
         log.info("Stopping proxy server")
+        self._stopping = True
         if self._stop_event is not None:
             self._stop_event.set()
 
@@ -148,8 +175,11 @@ class ProxyServer:
         self._tasks.clear()
 
         if self._pool is not None:
-            self._pool.reset()
-        cf_worker_pool.reset()
+            await self._pool.close()
+        await cf_worker_pool.close()
+        if self._h2_pool is not None:
+            await self._h2_pool.close()
+            self._h2_pool = None
         tcp_backoff.reset()
         stop_cfproxy_domain_refresh()
 
@@ -184,11 +214,12 @@ class ProxyServer:
             fallback=FallbackConfig(
                 cfproxy_enabled=self._config.cfproxy,
                 cfproxy_worker_domain=self._config.cfproxy_worker_domain,
+                disable_secure=self._config.disable_secure,
             ),
         )
 
     def _on_client(self, reader, writer) -> None:
-        if self._handler is None:
+        if self._handler is None or self._stopping:
             try:
                 writer.close()
             except Exception:
@@ -214,13 +245,31 @@ class ProxyServer:
                 await self._server.serve_forever()
         except asyncio.CancelledError:
             raise
+        except RuntimeError as exc:
+            # serve_forever() raises on a closed server during shutdown; that
+            # is expected, only surface it if we are not stopping.
+            if not self._stopping:
+                log.error("Server crashed: %s", exc, exc_info=True)
         except Exception as exc:
             log.error("Server crashed: %s", exc, exc_info=True)
 
     async def _log_stats_loop(self) -> None:
+        from .network_debug import log_ws_flow
+
+        next_stats = time.monotonic() + 60
         try:
             while True:
-                await asyncio.sleep(60)
+                await asyncio.sleep(5)
+                now = time.monotonic()
+                if logging.getLogger("tgwsproxy").isEnabledFor(logging.DEBUG):
+                    log_ws_flow(now)
+                    if self._h2_pool is not None:
+                        self._h2_pool.log_flow(now)
+                if now < next_stats:
+                    continue
+                next_stats = now + 60
                 log.info("stats: %s", stats.summary())
+                if self._h2_pool is not None:
+                    self._h2_pool.log_stats()
         except asyncio.CancelledError:
             raise
