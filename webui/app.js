@@ -80,10 +80,12 @@
             ['Через WebSocket',  c.ws],
             ['Через TCP fallback', c.tcp_fallback],
             ['Через Cloudflare', c.cfproxy],
+            ['С SNI-фронтингом', c.fronting],
             ['Замаскированные',  c.masked],
             ['Не прошли auth',   c.bad],
             ['Ошибок WS',        w.errors],
             ['Pool hit/miss',    `${w.pool_hits || 0} / ${w.pool_misses || 0}`],
+            ['CF pool hit/miss', `${w.cf_pool_hits || 0} / ${w.cf_pool_misses || 0}`],
             ['Передано',         t.human_up],
             ['Получено',         t.human_down],
         ];

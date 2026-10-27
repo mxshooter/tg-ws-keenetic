@@ -19,6 +19,7 @@ class Stats:
     connections_ws: int = 0
     connections_tcp_fallback: int = 0
     connections_cfproxy: int = 0
+    connections_fronting: int = 0
     connections_bad: int = 0
     connections_masked: int = 0
     ws_errors: int = 0
@@ -26,21 +27,27 @@ class Stats:
     bytes_down: int = 0
     pool_hits: int = 0
     pool_misses: int = 0
+    cf_pool_hits: int = 0
+    cf_pool_misses: int = 0
     started_at: float = field(default=0.0)
 
     def summary(self) -> str:
         pool = self.pool_hits + self.pool_misses
         pool_s = f"{self.pool_hits}/{pool}" if pool else "n/a"
+        cf_pool = self.cf_pool_hits + self.cf_pool_misses
+        cf_pool_s = f"{self.cf_pool_hits}/{cf_pool}" if cf_pool else "n/a"
         return (
             f"total={self.connections_total} "
             f"active={self.connections_active} "
             f"ws={self.connections_ws} "
             f"tcp_fb={self.connections_tcp_fallback} "
             f"cf={self.connections_cfproxy} "
+            f"front={self.connections_fronting} "
             f"bad={self.connections_bad} "
             f"masked={self.connections_masked} "
             f"err={self.ws_errors} "
             f"pool={pool_s} "
+            f"cf_pool={cf_pool_s} "
             f"up={human_bytes(self.bytes_up)} "
             f"down={human_bytes(self.bytes_down)}"
         )
@@ -53,6 +60,7 @@ class Stats:
                 "ws": self.connections_ws,
                 "tcp_fallback": self.connections_tcp_fallback,
                 "cfproxy": self.connections_cfproxy,
+                "fronting": self.connections_fronting,
                 "bad": self.connections_bad,
                 "masked": self.connections_masked,
             },
@@ -66,6 +74,8 @@ class Stats:
                 "errors": self.ws_errors,
                 "pool_hits": self.pool_hits,
                 "pool_misses": self.pool_misses,
+                "cf_pool_hits": self.cf_pool_hits,
+                "cf_pool_misses": self.cf_pool_misses,
             },
             "started_at": self.started_at,
         }

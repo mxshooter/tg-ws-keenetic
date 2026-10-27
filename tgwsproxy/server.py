@@ -12,11 +12,16 @@ import time
 from typing import Optional, Set
 
 from .balancer import balancer
-from .config import Config
-from .fallback import FallbackConfig
+from .config import (
+    Config,
+    start_cfproxy_domain_refresh,
+    stop_cfproxy_domain_refresh,
+)
+from .constants import DC_DEFAULT_IPS
+from .fallback import FallbackConfig, tcp_backoff
 from .handler import ClientHandler, HandlerSettings
 from .stats import stats
-from .ws_pool import WebSocketPool
+from .ws_pool import WebSocketPool, cf_worker_pool
 
 log = logging.getLogger("tgwsproxy.server")
 
@@ -55,8 +60,11 @@ class ProxyServer:
 
         if self._config.cfproxy and not self._config.cfproxy_user_domain:
             balancer.update_pool(self._config.cfproxy_default_pool())
+            start_cfproxy_domain_refresh(user_overridden=False)
         elif self._config.cfproxy_user_domain:
             balancer.update_pool([self._config.cfproxy_user_domain])
+
+        tcp_backoff.reset()
 
         self._pool = WebSocketPool(
             target_size=self._config.pool_size,
@@ -88,6 +96,15 @@ class ProxyServer:
 
         self._stats_task = asyncio.create_task(self._log_stats_loop())
         await self._pool.warmup(self._config.dc_redirects)
+
+        if self._config.cfproxy_worker_domain and not self._config.force_test_dc:
+            cf_fallbacks = {
+                dc: ip for dc, ip in DC_DEFAULT_IPS.items()
+                if dc not in self._config.dc_redirects
+            }
+            await cf_worker_pool.warmup(
+                cf_fallbacks, [self._config.cfproxy_worker_domain]
+            )
 
         self._serve_task = asyncio.create_task(self._serve_forever())
 
@@ -132,6 +149,9 @@ class ProxyServer:
 
         if self._pool is not None:
             self._pool.reset()
+        cf_worker_pool.reset()
+        tcp_backoff.reset()
+        stop_cfproxy_domain_refresh()
 
         self._server = None
         self._handler = None

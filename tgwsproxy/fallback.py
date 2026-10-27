@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
+import time
+from typing import Dict, Optional, Set, Tuple
 from urllib.parse import urlencode
 
 from .balancer import balancer
@@ -21,8 +22,55 @@ from .constants import DC_DEFAULT_IPS, DC_TEST_IPS
 from .crypto import ReencryptionContext
 from .stats import Stats
 from .websocket import RawWebSocket
+from .ws_pool import cf_worker_pool
 
 log = logging.getLogger("tgwsproxy.fallback")
+
+# Exponential backoff for direct TCP fallback — a downed fallback IP is
+# expensive to retry on every connection, so we suppress attempts for a while.
+TCP_BACKOFF_INITIAL = 30.0
+TCP_BACKOFF_MAX = 3600.0
+
+
+class _TcpBackoff:
+    """Tracks TCP-fallback failures so we don't hammer a dead endpoint."""
+
+    def __init__(self) -> None:
+        self._failures: Dict[Tuple[str, int], int] = {}
+        self._retry_after: Dict[Tuple[str, int], float] = {}
+        self._connecting: Set[Tuple[str, int]] = set()
+
+    def reset(self) -> None:
+        self._failures.clear()
+        self._retry_after.clear()
+        self._connecting.clear()
+
+    def is_blocked(self, key: Tuple[str, int]) -> bool:
+        return key in self._connecting or time.monotonic() < self._retry_after.get(
+            key, 0
+        )
+
+    def begin(self, key: Tuple[str, int]) -> None:
+        self._connecting.add(key)
+
+    def end(self, key: Tuple[str, int]) -> None:
+        self._connecting.discard(key)
+
+    def report_success(self, key: Tuple[str, int]) -> None:
+        self._failures.pop(key, None)
+        self._retry_after.pop(key, None)
+
+    def report_failure(self, key: Tuple[str, int]) -> float:
+        failures = self._failures.get(key, 0) + 1
+        self._failures[key] = failures
+        delay = min(
+            TCP_BACKOFF_INITIAL * 2 ** min(failures - 1, 7), TCP_BACKOFF_MAX
+        )
+        self._retry_after[key] = time.monotonic() + delay
+        return delay
+
+
+tcp_backoff = _TcpBackoff()
 
 
 class FallbackConfig:
@@ -84,14 +132,14 @@ async def attempt_fallback(
             return True
 
     if target_ip:
-        log.info("[%s] DC%d%s -> TCP fallback %s:443",
-                 label, dc, media_tag, target_ip)
         if await _tcp(
             client_reader,
             client_writer,
             target_ip,
             relay_init,
             label,
+            dc,
+            media_tag,
             ctx,
             stats,
         ):
@@ -114,19 +162,32 @@ async def _cfworker(
     splitter,
 ) -> bool:
     media_tag = " media" if is_media else ""
-    domain = cfg.cfproxy_worker_domain
-    query = urlencode(
-        {"dst": target_ip, "dc": str(dc), "media": "1" if is_media else "0"}
-    )
-    log.info("[%s] DC%d%s -> CF worker %s", label, dc, media_tag, domain)
-    try:
-        ws = await RawWebSocket.connect(
-            domain, domain, timeout=10.0, path=f"/apiws?{query}"
-        )
-    except Exception as exc:
-        log.warning("[%s] DC%d%s CF worker failed: %r",
-                    label, dc, media_tag, exc)
-        return False
+    worker_domains = [cfg.cfproxy_worker_domain]
+
+    pooled = await cf_worker_pool.acquire(dc, target_ip, worker_domains)
+    if pooled is not None:
+        ws, worker_domain = pooled
+        log.info("[%s] DC%d%s -> CF worker pool hit via %s for %s",
+                 label, dc, media_tag, worker_domain, target_ip)
+    else:
+        query = urlencode({"dst": target_ip, "dc": str(dc)})
+        path = f"/apiws?{query}"
+        ws = None
+        for worker_domain in cf_worker_pool.available_domains(worker_domains):
+            log.info("[%s] DC%d%s -> CF worker %s for %s",
+                     label, dc, media_tag, worker_domain, target_ip)
+            try:
+                ws = await RawWebSocket.connect(
+                    worker_domain, worker_domain, timeout=10.0, path=path
+                )
+                break
+            except Exception as exc:
+                cf_worker_pool.report_failure(worker_domain, exc)
+                log.warning("[%s] DC%d%s CF worker %s failed: %r",
+                            label, dc, media_tag, worker_domain, exc)
+                continue
+        if ws is None:
+            return False
 
     stats.connections_cfproxy += 1
     await ws.send(relay_init)
@@ -184,22 +245,49 @@ async def _tcp(
     dst,
     relay_init,
     label,
+    dc,
+    media_tag,
     ctx,
     stats,
 ) -> bool:
-    try:
-        remote_reader, remote_writer = await asyncio.wait_for(
-            asyncio.open_connection(dst, 443), timeout=10
-        )
-    except Exception as exc:
-        log.warning("[%s] TCP fallback %s:443 failed: %r", label, dst, exc)
+    key = (dst, 443)
+    if tcp_backoff.is_blocked(key):
+        log.debug("[%s] DC%d%s TCP fallback to %s:443 skipped (backoff)",
+                  label, dc, media_tag, dst)
         return False
 
-    stats.connections_tcp_fallback += 1
-    remote_writer.write(relay_init)
-    await remote_writer.drain()
-    await bridge_tcp(
-        client_reader, client_writer, remote_reader, remote_writer,
-        label, ctx, stats,
-    )
-    return True
+    tcp_backoff.begin(key)
+    remote_writer = None
+    try:
+        try:
+            log.info("[%s] DC%d%s -> TCP fallback %s:443",
+                     label, dc, media_tag, dst)
+            remote_reader, remote_writer = await asyncio.wait_for(
+                asyncio.open_connection(dst, 443), timeout=10
+            )
+            remote_writer.write(relay_init)
+            await remote_writer.drain()
+        except Exception as exc:
+            delay = tcp_backoff.report_failure(key)
+            log.warning(
+                "[%s] TCP fallback %s:443 failed: %r; retry in %.0fs",
+                label, dst, exc, delay,
+            )
+            return False
+        finally:
+            tcp_backoff.end(key)
+
+        tcp_backoff.report_success(key)
+        stats.connections_tcp_fallback += 1
+        await bridge_tcp(
+            client_reader, client_writer, remote_reader, remote_writer,
+            label, ctx, stats,
+        )
+        return True
+    finally:
+        if remote_writer is not None:
+            try:
+                remote_writer.close()
+                await remote_writer.wait_closed()
+            except (OSError, ConnectionError):
+                pass

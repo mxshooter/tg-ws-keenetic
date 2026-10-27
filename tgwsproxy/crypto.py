@@ -15,10 +15,9 @@ import hashlib
 import os
 import struct
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-
+from ._aes import Cipher, algorithms, modes
 from .constants import (
     DC_IDX_POS,
     HANDSHAKE_LEN,
@@ -175,16 +174,3 @@ def build_context(
         upstream_encrypt=upstream_encrypt,
         upstream_decrypt=upstream_decrypt,
     )
-
-
-def upstream_packet_decryptor(relay_handshake: bytes):
-    """Return a fresh decryptor for the upstream encrypted stream.
-
-    Used by MessageSplitter to peek packet lengths without disturbing the
-    main upstream_encrypt stream.
-    """
-    key = relay_handshake[SKIP_LEN : SKIP_LEN + PREKEY_LEN]
-    iv = relay_handshake[SKIP_LEN + PREKEY_LEN : SKIP_LEN + PREKEY_LEN + IV_LEN]
-    dec = _aes_ctr(key, iv)
-    dec.update(ZERO_64)
-    return dec

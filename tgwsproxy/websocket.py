@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import os
 import socket as _socket
 import ssl
@@ -26,6 +27,8 @@ from .constants import (
     WS_OP_TEXT,
 )
 
+log = logging.getLogger("tgwsproxy.websocket")
+
 _HEAD_BB = struct.Struct(">BB")
 _HEAD_BBH = struct.Struct(">BBH")
 _HEAD_BBQ = struct.Struct(">BBQ")
@@ -34,6 +37,11 @@ _HEAD_BBH4 = struct.Struct(">BBH4s")
 _HEAD_BBQ4 = struct.Struct(">BBQ4s")
 _UNPACK_H = struct.Struct(">H")
 _UNPACK_Q = struct.Struct(">Q")
+
+# Precomputed XOR translation tables: _XOR_TABLES[key][value] == value ^ key.
+# Lets large payloads mask 4 byte-lanes at a time via bytes.translate instead
+# of building big integers, which is markedly faster on slow router CPUs.
+_XOR_TABLES = tuple(bytes(value ^ key for value in range(256)) for key in range(256))
 
 _SSL_CTX = ssl.create_default_context()
 _SSL_CTX.check_hostname = False
@@ -79,6 +87,13 @@ def _xor_mask(data: bytes, mask: bytes) -> bytes:
     if not data:
         return data
     n = len(data)
+    if n >= 512:
+        masked = bytearray(data)
+        for offset in range(4):
+            masked[offset::4] = masked[offset::4].translate(
+                _XOR_TABLES[mask[offset]]
+            )
+        return bytes(masked)
     repeated = (mask * ((n // 4) + 1))[:n]
     return (
         int.from_bytes(data, "big") ^ int.from_bytes(repeated, "big")
@@ -107,6 +122,18 @@ class RawWebSocket:
     def closed(self) -> bool:
         return self._closed or self.writer.transport.is_closing()
 
+    @property
+    def stale(self) -> bool:
+        """True if the socket is closed, EOF'd, or errored — i.e. unusable."""
+        try:
+            if self._closed or self.writer.transport.is_closing():
+                return True
+            if self.reader.at_eof() or self.reader.exception() is not None:
+                return True
+        except Exception:
+            return True
+        return False
+
     @classmethod
     async def connect(
         cls,
@@ -115,10 +142,14 @@ class RawWebSocket:
         timeout: float = 10.0,
         path: str = "/apiws",
         buffer_size: int = 256 * 1024,
+        *,
+        sni: Optional[str] = None,
     ) -> "RawWebSocket":
+        if sni is None:
+            sni = sni_domain
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(
-                host, 443, ssl=_SSL_CTX, server_hostname=sni_domain
+                host, 443, ssl=_SSL_CTX, server_hostname=sni
             ),
             timeout=min(timeout, 10),
         )
@@ -202,6 +233,10 @@ class RawWebSocket:
 
             if opcode == WS_OP_CLOSE:
                 self._closed = True
+                code, reason = self._parse_close(payload)
+                log.debug(
+                    "WS OP_CLOSE from upstream: code=%s reason=%r", code, reason
+                )
                 try:
                     self.writer.write(
                         self._frame(
@@ -270,6 +305,27 @@ class RawWebSocket:
                 _HEAD_BBH4.pack(flags, WS_MASK_BIT | 126, length, mask) + masked
             )
         return _HEAD_BBQ4.pack(flags, WS_MASK_BIT | 127, length, mask) + masked
+
+    _WS_CLOSE_REASONS = {
+        1000: "normal", 1001: "going_away", 1002: "protocol_error",
+        1003: "unsupported_data", 1006: "abnormal", 1007: "bad_data",
+        1008: "policy_violation", 1009: "too_big", 1010: "missing_extension",
+        1011: "internal_error",
+    }
+
+    @classmethod
+    def _parse_close(
+        cls, payload: Optional[bytes]
+    ) -> Tuple[Optional[int], str]:
+        if not payload or len(payload) < 2:
+            return None, ""
+        try:
+            code = int.from_bytes(payload[:2], "big")
+            text = payload[2:].decode("utf-8", errors="replace")
+            name = cls._WS_CLOSE_REASONS.get(code)
+            return code, f"{text} ({name})" if name else text
+        except Exception:
+            return None, ""
 
     async def _read_frame(self) -> Tuple[int, bytes, bool]:
         header = await self.reader.readexactly(2)

@@ -15,13 +15,10 @@ import logging
 import struct
 from typing import List, Optional
 
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-
 from .constants import (
     PROTO_INT_ABRIDGED,
     PROTO_INT_INTERMEDIATE,
     PROTO_INT_PADDED_INTERMEDIATE,
-    ZERO_64,
 )
 from .crypto import ReencryptionContext
 from .stats import Stats, human_bytes
@@ -34,28 +31,22 @@ _UNPACK_LE_U32 = struct.Struct("<I")
 class MessageSplitter:
     """Decrypts incoming chunks just enough to know packet boundaries."""
 
-    __slots__ = ("_decryptor", "_proto", "_cipher_buf", "_plain_buf", "_off")
+    __slots__ = ("_proto", "_cipher_buf", "_plain_buf", "_off")
 
-    def __init__(self, relay_handshake: bytes, proto_int: int) -> None:
-        cipher = Cipher(
-            algorithms.AES(relay_handshake[8:40]),
-            modes.CTR(relay_handshake[40:56]),
-        )
-        self._decryptor = cipher.encryptor()
-        self._decryptor.update(ZERO_64)
+    def __init__(self, proto_int: int) -> None:
         self._proto = proto_int
         self._cipher_buf = bytearray()
         self._plain_buf = bytearray()
         self._off = False  # set to True if we hit an unknown packet shape
 
-    def split(self, chunk: bytes) -> List[bytes]:
+    def split(self, chunk: bytes, plain: bytes) -> List[bytes]:
         if not chunk:
             return []
         if self._off:
             return [chunk]
 
         self._cipher_buf.extend(chunk)
-        self._plain_buf.extend(self._decryptor.update(chunk))
+        self._plain_buf.extend(plain)
 
         parts: List[bytes] = []
         offset = 0
@@ -70,11 +61,17 @@ class MessageSplitter:
                 break
             if length <= 0:
                 # Unknown — flush remainder as one piece and stop splitting.
-                parts.append(bytes(self._cipher_buf[offset:]))
+                parts.append(
+                    bytes(self._cipher_buf) if offset == 0
+                    else bytes(self._cipher_buf[offset:])
+                )
                 offset = buf_len
                 self._off = True
                 break
-            parts.append(bytes(self._cipher_buf[offset : offset + length]))
+            if offset == 0 and length == buf_len:
+                parts.append(bytes(self._cipher_buf))
+            else:
+                parts.append(bytes(self._cipher_buf[offset : offset + length]))
             offset += length
 
         if offset:
@@ -163,11 +160,10 @@ async def bridge_ws(
                 up_bytes += len(chunk)
                 up_packets += 1
                 stats.bytes_up += len(chunk)
-                reencrypted = ctx.upstream_encrypt.update(
-                    ctx.client_decrypt.update(chunk)
-                )
+                plain = ctx.client_decrypt.update(chunk)
+                reencrypted = ctx.upstream_encrypt.update(plain)
                 if splitter:
-                    parts = splitter.split(reencrypted)
+                    parts = splitter.split(reencrypted, plain)
                     if not parts:
                         continue
                     if len(parts) > 1:

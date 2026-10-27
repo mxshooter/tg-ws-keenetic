@@ -26,14 +26,23 @@ die()     { printf '\033[31mERROR:\033[0m %s\n' "$1" >&2; exit 1; }
 [ -d /opt ] || die "/opt not found — install Entware first."
 [ -d ./tgwsproxy ] || die "Run this from the project root (need ./tgwsproxy/ folder)."
 
-bold "Checking Python and cryptography..."
+bold "Checking Python and AES backend..."
 PYTHON_BIN=$(command -v python3 || true)
 [ -x "$PYTHON_BIN" ] || die "python3 not installed. Run: opkg install python3"
 
-if ! "$PYTHON_BIN" -c 'import cryptography' >/dev/null 2>&1; then
-    die "python3-cryptography is missing. Run: opkg install python3-cryptography"
+# AES-CTR prefers python3-cryptography, but falls back to the system libcrypto
+# (OpenSSL) via ctypes when it is absent. Only fail if neither is usable.
+if "$PYTHON_BIN" -c 'import cryptography' >/dev/null 2>&1; then
+    ok "python3-cryptography is available"
+elif "$PYTHON_BIN" -c '
+import ctypes, ctypes.util
+name = ctypes.util.find_library("crypto")
+ctypes.CDLL(name or "libcrypto.so")
+' >/dev/null 2>&1; then
+    ok "python3-cryptography missing; using system libcrypto via ctypes"
+else
+    die "No AES backend. Install python3-cryptography or libopenssl: opkg install python3-cryptography"
 fi
-ok "Python and cryptography are available"
 
 bold "Creating directories..."
 mkdir -p "$INSTALL_ROOT" "$CONFIG_DIR" "$LOG_DIR" "$RUN_DIR"
