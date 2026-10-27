@@ -53,6 +53,21 @@
         <div id="update-result" class="result"></div>
     </section>
 
+    <section class="card" id="log-card">
+        <h2>Журнал (с момента запуска)</h2>
+        <div class="log-toolbar">
+            <label class="log-autoscroll">
+                <input id="log-autoscroll" type="checkbox" checked /> Автопрокрутка
+            </label>
+            <span id="log-status" class="muted"></span>
+            <div class="log-actions">
+                <button id="btn-log-refresh" type="button" class="secondary">Обновить</button>
+                <button id="btn-log-clear" type="button" class="secondary">Очистить вид</button>
+            </div>
+        </div>
+        <pre id="log-view" class="log-view">Загрузка…</pre>
+    </section>
+
     <section class="card">
         <h2>Настройки</h2>
         <form id="cfg" autocomplete="off">

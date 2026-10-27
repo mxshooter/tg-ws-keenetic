@@ -9,6 +9,7 @@ Routes:
     GET  /style.css     -> bundled stylesheet
     GET  /app.js        -> bundled script
     GET  /api/state     -> {config, stats, link}
+    GET  /api/logs      -> {session, cursor, lines} in-memory log since start
     POST /api/config    -> save config (body: full Config JSON), then restart
     POST /api/restart   -> restart proxy with current saved config
     POST /api/secret    -> regenerate secret, save and restart
@@ -33,6 +34,7 @@ from .config import (
     proxy_tg_link,
     save_config,
 )
+from .logging_setup import get_log_buffer
 from .server import ProxyServer
 from .updater import (
     PreparedUpdate,
@@ -57,16 +59,27 @@ _CONTENT_TYPES = {
 
 
 class _HttpRequest:
-    __slots__ = ("method", "path", "headers", "body")
+    __slots__ = ("method", "path", "headers", "body", "query")
 
-    def __init__(self, method: str, path: str, headers: Dict[str, str], body: bytes):
+    def __init__(
+        self,
+        method: str,
+        path: str,
+        headers: Dict[str, str],
+        body: bytes,
+        query: Optional[Dict[str, str]] = None,
+    ):
         self.method = method
         self.path = path
         self.headers = headers
         self.body = body
+        self.query = query or {}
 
     def header(self, name: str, default: str = "") -> str:
         return self.headers.get(name.lower(), default)
+
+    def arg(self, name: str, default: str = "") -> str:
+        return self.query.get(name, default)
 
 
 Handler = Callable[[_HttpRequest], Awaitable[Tuple[int, bytes, Dict[str, str]]]]
@@ -85,6 +98,7 @@ class WebUI:
         self._http_server: Optional[asyncio.AbstractServer] = None
         self._routes: Dict[Tuple[str, str], Handler] = {
             ("GET", "/api/state"): self._handle_state,
+            ("GET", "/api/logs"): self._handle_logs,
             ("POST", "/api/config"): self._handle_save_config,
             ("POST", "/api/restart"): self._handle_restart,
             ("POST", "/api/secret"): self._handle_new_secret,
@@ -205,6 +219,25 @@ class WebUI:
             indent=2,
         ).encode("utf-8")
         return 200, body, {"Content-Type": "application/json; charset=utf-8"}
+
+    async def _handle_logs(self, request: _HttpRequest):
+        """Return log lines captured since the service started.
+
+        `?since=<cursor>` returns only newer lines; the client passes back the
+        `cursor` from the previous response. `session` changes on restart, so
+        the UI can reset the buffer when a new process has started.
+        """
+        buf = get_log_buffer()
+        if buf is None:
+            return _json_ok({"session": "", "cursor": 0, "lines": []})
+        try:
+            since = int(request.arg("since", "0") or "0")
+        except ValueError:
+            since = 0
+        cursor, lines = buf.snapshot(since)
+        return _json_ok(
+            {"session": buf.session, "cursor": cursor, "lines": lines}
+        )
 
     async def _handle_save_config(self, request: _HttpRequest):
         try:
@@ -327,9 +360,18 @@ async def _read_request(reader) -> Optional[_HttpRequest]:
     if length > 0:
         body = await reader.readexactly(min(length, 1 * 1024 * 1024))
 
-    # Strip query string — we don't use it.
-    path = raw_path.split("?", 1)[0] or "/"
-    return _HttpRequest(method.upper(), path, headers, body)
+    # Split off the query string; `/api/logs` uses ?since=<cursor>.
+    raw_query = ""
+    if "?" in raw_path:
+        raw_path, raw_query = raw_path.split("?", 1)
+    query: Dict[str, str] = {}
+    for pair in raw_query.split("&"):
+        if not pair:
+            continue
+        k, _, v = pair.partition("=")
+        query[k] = v
+    path = raw_path or "/"
+    return _HttpRequest(method.upper(), path, headers, body, query)
 
 
 async def _respond(
