@@ -19,11 +19,7 @@ from .config import (
 )
 from .constants import DC_DEFAULT_IPS
 from .fallback import FallbackConfig, tcp_backoff
-from .fake_tls import (
-    probe_appdata_len,
-    set_profiled_appdata_len,
-    x25519_backend,
-)
+from .fake_tls import probe_appdata_len, set_profiled_appdata_len
 from .handler import ClientHandler, HandlerSettings
 from .stats import stats
 from .ws_pool import WebSocketPool, cf_worker_pool
@@ -120,11 +116,7 @@ class ProxyServer:
         for dc, ip in sorted(self._config.dc_redirects.items()):
             log.info("    DC%d -> %s", dc, ip)
         if self._config.fake_tls_domain:
-            log.info(
-                "  Fake TLS: %s (X25519 backend: %s)",
-                self._config.fake_tls_domain,
-                x25519_backend(),
-            )
+            log.info("  Fake TLS: %s", self._config.fake_tls_domain)
         if self._config.cfproxy_worker_domain:
             log.info("  CF worker: %s", self._config.cfproxy_worker_domain)
         if self._h2_pool is not None:
