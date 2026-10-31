@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import struct
 from dataclasses import dataclass
 from typing import Dict, Optional
@@ -24,8 +25,10 @@ from .crypto import (
     parse_client_handshake,
 )
 from .fake_tls import (
+    SERVER_HELLO_DELAY,
     FakeTlsStream,
     build_server_hello,
+    parse_client_hello,
     relay_to_masking_domain,
     verify_client_hello,
 )
@@ -208,8 +211,14 @@ class ClientHandler:
 
         client_random, session_id, _ = verified
         server_hello = build_server_hello(
-            self._settings.secret, client_random, session_id
+            self._settings.secret,
+            client_random,
+            session_id,
+            parse_client_hello(client_hello),
         )
+        # A real TLS server never answers instantly; the jitter blunts
+        # "ServerHello latency == 0" DPI heuristics.
+        await asyncio.sleep(random.uniform(*SERVER_HELLO_DELAY))
         writer.write(server_hello)
         await writer.drain()
 

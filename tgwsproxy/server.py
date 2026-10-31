@@ -19,6 +19,7 @@ from .config import (
 )
 from .constants import DC_DEFAULT_IPS
 from .fallback import FallbackConfig, tcp_backoff
+from .fake_tls import probe_appdata_len, set_profiled_appdata_len
 from .handler import ClientHandler, HandlerSettings
 from .stats import stats
 from .ws_pool import WebSocketPool, cf_worker_pool
@@ -98,6 +99,10 @@ class ProxyServer:
         )
         stats.started_at = time.time()
 
+        # Probe before listening so a masking domain that resolves back to
+        # this proxy fails fast instead of answering itself.
+        await self._apply_fake_tls_profile()
+
         self._server = await asyncio.start_server(
             self._on_client, self._config.host, self._config.port
         )
@@ -133,6 +138,31 @@ class ProxyServer:
             )
 
         self._serve_task = asyncio.create_task(self._serve_forever())
+
+    async def _apply_fake_tls_profile(self) -> None:
+        """Copy the masking site's first encrypted record size once.
+
+        Telegram clients get a dummy ApplicationData record right after
+        ServerHello; giving it the same size the real site uses keeps the
+        flight from standing out to DPI. Without a profile the size stays in
+        a small fallback range instead of the classic 1900-2100 bytes.
+        """
+        set_profiled_appdata_len(None)
+        domain = self._config.fake_tls_domain
+        if not domain:
+            return
+        appdata_len = await probe_appdata_len(domain)
+        set_profiled_appdata_len(appdata_len)
+        if appdata_len is None:
+            log.warning(
+                "Fake TLS profile unavailable, ServerHello uses random "
+                "record sizes"
+            )
+        else:
+            log.info(
+                "Fake TLS profile: first encrypted record %d bytes",
+                appdata_len,
+            )
 
     async def stop(self) -> None:
         if not self.listening:
