@@ -59,6 +59,24 @@ try:
 except ImportError:
     X25519PrivateKey = None
 
+X25519_BACKEND = "cryptography"
+
+
+def x25519_backend() -> str:
+    """Name (and version) of the implementation behind the forged key share."""
+    if X25519PrivateKey is None:
+        return "random-fallback"
+    try:
+        from cryptography import __version__ as version
+    except ImportError:
+        return X25519_BACKEND
+    return "%s %s" % (X25519_BACKEND, version)
+
+
+def has_real_x25519() -> bool:
+    """False when key shares are random bytes instead of Curve25519 points."""
+    return X25519PrivateKey is not None
+
 log = logging.getLogger("tgwsproxy.fake_tls")
 
 _CCS_FRAME = b"\x14\x03\x03\x00\x01\x01"

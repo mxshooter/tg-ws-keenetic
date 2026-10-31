@@ -431,6 +431,21 @@ class ProbeAppdataLenTest(unittest.TestCase):
         self.assertIsNone(asyncio.run(scenario()))
 
 
+class BackendReportTest(unittest.TestCase):
+    def test_reports_the_generation_backend(self):
+        expected = "cryptography" if fake_tls.has_real_x25519() else "random"
+        self.assertIn(expected, fake_tls.x25519_backend())
+
+    def test_flags_random_fallback(self):
+        saved = fake_tls.X25519PrivateKey
+        fake_tls.X25519PrivateKey = None
+        try:
+            self.assertFalse(fake_tls.has_real_x25519())
+            self.assertIn("random", fake_tls.x25519_backend())
+        finally:
+            fake_tls.X25519PrivateKey = saved
+
+
 class WrapTlsRecordsTest(unittest.TestCase):
     def test_short_payload_becomes_one_record(self):
         wrapped = wrap_tls_records(b"hello")

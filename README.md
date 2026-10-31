@@ -114,6 +114,16 @@ sh scripts/install.sh
 как и в остальных логах. Полный журнал с ротацией по-прежнему пишется в
 `/opt/var/log/tgwsproxy/`.
 
+При каждом старте в баннер пишется, какие крипто-бэкенды используются:
+
+```
+  Crypto: AES=cryptography 46.0.5 | X25519=cryptography 46.0.5
+```
+
+Если `cryptography` нет, будет `AES=libcrypto (ctypes) | X25519=random-fallback`
+и предупреждение: в этом режиме ключ в Fake-TLS ServerHello — случайные
+байты, а не точка Curve25519. Лечится `opkg install python3-cryptography`.
+
 ## Безопасность веб-интерфейса
 
 По умолчанию UI слушает `0.0.0.0:1434` и **без пароля**. Это нормально
