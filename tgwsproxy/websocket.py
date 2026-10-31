@@ -44,6 +44,18 @@ _UNPACK_Q = struct.Struct(">Q")
 _XOR_TABLES = tuple(bytes(value ^ key for value in range(256)) for key in range(256))
 
 
+def set_x25519(context: ssl.SSLContext) -> None:
+    """Pin the ECDH group to X25519 when the local OpenSSL allows it.
+
+    Older Entware OpenSSL builds (and Windows 7 era ones) reject the curve;
+    the failure is harmless, so it is swallowed.
+    """
+    try:
+        context.set_ecdh_curve("X25519")
+    except Exception:
+        pass
+
+
 def create_ssl_context(
     *, check_hostname: bool = False, verify: bool = False
 ) -> ssl.SSLContext:
@@ -55,6 +67,7 @@ def create_ssl_context(
     Cloudflare) can pass ``verify=True``.
     """
     context = ssl.create_default_context()
+    set_x25519(context)
     if verify:
         context.check_hostname = check_hostname
     else:

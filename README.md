@@ -142,7 +142,7 @@ ssh -L 1434:127.0.0.1:1434 root@<router>
 | `cfproxy_worker_domain` | str | Свой CF Worker URL (пробуется первым) |
 | `cfproxy_h2_media` | bool | Мультиплексировать медиа-трафик по HTTP/2 к CF (нужны `httpx`+`h2`) |
 | `disable_secure` | bool | CF-подключения по HTTP (порт 80) вместо TLS |
-| `fake_tls_domain` | str | SNI для Fake-TLS маскировки; пусто = выкл. |
+| `fake_tls_domain` | str | SNI для Fake-TLS маскировки; пусто = выкл. На старте размер «заглушки» подстраивается под реальный сайт. |
 | `proxy_protocol` | bool | Принимать PROXY protocol v1 (если за nginx/haproxy) |
 | `force_test_dc` | bool | Форсировать ВСЕ соединения на Telegram TEST датацентры |
 | `log_file`, `log_max_mb`, `log_backups` | | Ротация логов |

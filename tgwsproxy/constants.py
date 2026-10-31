@@ -76,6 +76,35 @@ SESSION_ID_LEN = 32
 # Tolerance for client_random embedded timestamp (seconds).
 TIMESTAMP_TOLERANCE = 120
 
+TLS_VERSION_12 = b"\x03\x03"
+
+# --- Forged ServerHello layout ------------------------------------------
+
+EXT_SUPPORTED_VERSIONS = 0x002B
+EXT_KEY_SHARE = 0x0033
+
+GROUP_X25519 = 0x001D
+GROUP_X25519MLKEM768 = 0x11EC
+
+X25519_KEY_LEN = 32
+X25519MLKEM768_CLIENT_SHARE_LEN = 1216
+MLKEM768_CIPHERTEXT_LEN = 1088
+
+# TLS 1.3 suites in the order a typical server picks them from the client list.
+CIPHER_PREFERENCE = (0x1301, 0x1303, 0x1302)
+
+# Bounds for the single ApplicationData record that follows CCS. The low bound
+# matches the smallest record telemt emits, the high one is the TLS limit.
+APPDATA_MIN = 64
+# Without a masking-site profile stay near the 64-byte record telemt passed DPI
+# with, far from the 1900-2100 bytes of the classic MTProxy answer.
+FALLBACK_APPDATA_RANGE = (64, 160)
+
+# A real TLS server never answers in the same instant it was asked.
+SERVER_HELLO_DELAY = (0.008, 0.024)
+
+PROFILE_PROBE_TIMEOUT = 5
+
 # --- WebSocket -----------------------------------------------------------
 
 WS_OP_CONT = 0x0
