@@ -133,7 +133,7 @@ tail -n 50 /opt/var/log/tgwsproxy/tgwsproxy.log
 
 | Сообщение | Что значит | Что делать |
 |---|---|---|
-| `ModuleNotFoundError: No module named 'cryptography'` | нет `cryptography` (не критично, если есть `libcrypto`) | `opkg install python3-cryptography` |
+| `ModuleNotFoundError: No module named 'cryptography'` | нет `cryptography` (не критично: AES возьмётся из `libcrypto`, X25519 — из чистого Python) | `opkg install python3-cryptography` |
 | `libcrypto not found` | нет ни `cryptography`, ни системного OpenSSL | `opkg install python3-cryptography` или `opkg install libopenssl` |
 | `OSError: [Errno 98] Address already in use` | порт 1433/1434 занят | измените порт в `config.json` |
 | `Cannot persist config to ...: Read-only file system` | не примонтирован `/opt` | проверьте USB-накопитель |
