@@ -17,7 +17,6 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from tgwsproxy import fake_tls
-from tgwsproxy._curve25519 import is_valid_point
 from tgwsproxy.fake_tls import (
     APPDATA_MIN,
     CLIENT_RANDOM_LEN,
@@ -293,18 +292,6 @@ class BuildServerHelloTest(unittest.TestCase):
             struct.unpack_from(">H", extensions[1][1])[0], GROUP_X25519
         )
 
-    def test_key_share_is_a_real_curve_point_without_cryptography(self):
-        saved = fake_tls.X25519PrivateKey
-        fake_tls.X25519PrivateKey = None
-        try:
-            records = _split_records(self._build(_structured_client_hello()))
-        finally:
-            fake_tls.X25519PrivateKey = saved
-        _, extensions = _server_hello_fields(records[0][1])
-        key_share = extensions[1][1]
-        # post-quantum flight: 1088-byte ciphertext + 32-byte X25519 share
-        self.assertTrue(is_valid_point(key_share[-X25519_KEY_LEN:]))
-
     def test_picks_cipher_offered_by_client(self):
         hello = _structured_client_hello(suites=(0x1302, 0x1303))
         cipher, _ = _server_hello_fields(
@@ -442,6 +429,21 @@ class ProbeAppdataLenTest(unittest.TestCase):
             return await probe_appdata_len("127.0.0.1", port, timeout=1)
 
         self.assertIsNone(asyncio.run(scenario()))
+
+
+class BackendReportTest(unittest.TestCase):
+    def test_reports_the_generation_backend(self):
+        expected = "cryptography" if fake_tls.has_real_x25519() else "random"
+        self.assertIn(expected, fake_tls.x25519_backend())
+
+    def test_flags_random_fallback(self):
+        saved = fake_tls.X25519PrivateKey
+        fake_tls.X25519PrivateKey = None
+        try:
+            self.assertFalse(fake_tls.has_real_x25519())
+            self.assertIn("random", fake_tls.x25519_backend())
+        finally:
+            fake_tls.X25519PrivateKey = saved
 
 
 class WrapTlsRecordsTest(unittest.TestCase):

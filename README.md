@@ -26,7 +26,7 @@ Telegram MTProto → WebSocket прокси, который запускаетс
 | Конфиг | `/opt/etc/tgwsproxy/config.json` | редактируется через web UI |
 | Логи | `/opt/var/log/tgwsproxy/` | с авто-ротацией |
 | Код | `/opt/share/tgwsproxy/` | обновляется через `scripts/install.sh` |
-| Зависимости | `python3` (+ любой AES-бэкенд: `python3-cryptography` или системный `libcrypto`); опционально `python3-httpx` + `python3-h2` для HTTP/2-медиа | ставятся через `opkg`/`pip`; без `cryptography` X25519 считается на чистом Python |
+| Зависимости | `python3` (+ любой AES-бэкенд: `python3-cryptography` или системный `libcrypto`); опционально `python3-httpx` + `python3-h2` для HTTP/2-медиа | ставятся через `opkg`/`pip` |
 
 ## Установка
 
@@ -114,6 +114,16 @@ sh scripts/install.sh
 как и в остальных логах. Полный журнал с ротацией по-прежнему пишется в
 `/opt/var/log/tgwsproxy/`.
 
+При каждом старте в баннер пишется, какие крипто-бэкенды используются:
+
+```
+  Crypto: AES=cryptography 46.0.5 | X25519=cryptography 46.0.5
+```
+
+Если `cryptography` нет, будет `AES=libcrypto (ctypes) | X25519=random-fallback`
+и предупреждение: в этом режиме ключ в Fake-TLS ServerHello — случайные
+байты, а не точка Curve25519. Лечится `opkg install python3-cryptography`.
+
 ## Безопасность веб-интерфейса
 
 По умолчанию UI слушает `0.0.0.0:1434` и **без пароля**. Это нормально
@@ -163,9 +173,6 @@ sh scripts/uninstall.sh --purge   # снести всё
 - **AES-бэкенд**: `python3-cryptography`, а при его отсутствии — системный
   `libcrypto` (OpenSSL) через `ctypes`; отдельный пакет `cryptography` не
   обязателен.
-- **X25519 (Fake-TLS)**: ключ для поддельного ServerHello всегда настоящий —
-  через `cryptography`, а без неё — чистым Python (RFC 7748, ~1 мс на
-  десктопе, скрывается джиттером ServerHello).
 - **HTTP/2-медиа** (опционально): для мультиплексирования медиа через CF
   нужны `httpx[http2]` и `h2`. Если их нет — прокси автоматически работает
   через WS, ничего не ломается.

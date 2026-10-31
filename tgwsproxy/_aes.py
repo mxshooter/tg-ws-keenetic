@@ -11,9 +11,12 @@ of `cryptography.hazmat.primitives.ciphers` this project uses:
 from __future__ import annotations
 
 try:
+    import cryptography
     from cryptography.hazmat.primitives.ciphers import (  # noqa: F401
         Cipher, algorithms, modes,
     )
+
+    AES_BACKEND = "cryptography %s" % cryptography.__version__
 except ImportError:
     import ctypes
     import ctypes.util
@@ -40,6 +43,8 @@ except ImportError:
         )
 
     _libcrypto = _load_libcrypto()
+
+    AES_BACKEND = "libcrypto (ctypes)"
 
     _libcrypto.EVP_CIPHER_CTX_new.restype = ctypes.c_void_p
     _libcrypto.EVP_CIPHER_CTX_free.argtypes = [ctypes.c_void_p]

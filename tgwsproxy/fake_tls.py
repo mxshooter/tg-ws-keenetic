@@ -47,17 +47,35 @@ from .constants import (
     X25519MLKEM768_CLIENT_SHARE_LEN,
     X25519_KEY_LEN,
 )
-from ._curve25519 import x25519_public_key
 from .websocket import set_x25519
 
 try:
-    # Entware routers rarely ship cryptography; the pure-Python fallback
-    # below still produces a genuine Curve25519 key.
+    # Entware routers rarely ship cryptography: generating a real X25519 key
+    # is optional, the random fallback below is good enough for a reply the
+    # client never uses to derive keys (the real crypto is the ee-secret HMAC).
     from cryptography.hazmat.primitives.asymmetric.x25519 import (
         X25519PrivateKey,
     )
 except ImportError:
     X25519PrivateKey = None
+
+X25519_BACKEND = "cryptography"
+
+
+def x25519_backend() -> str:
+    """Name (and version) of the implementation behind the forged key share."""
+    if X25519PrivateKey is None:
+        return "random-fallback"
+    try:
+        from cryptography import __version__ as version
+    except ImportError:
+        return X25519_BACKEND
+    return "%s %s" % (X25519_BACKEND, version)
+
+
+def has_real_x25519() -> bool:
+    """False when key shares are random bytes instead of Curve25519 points."""
+    return X25519PrivateKey is not None
 
 log = logging.getLogger("tgwsproxy.fake_tls")
 
@@ -174,25 +192,15 @@ def _select_cipher_suite(info: ClientHelloInfo) -> int:
 
 
 def _x25519_public_key() -> bytes:
-    """Return a real Curve25519 public key for a fresh random scalar."""
-    private_key = os.urandom(X25519_KEY_LEN)
     if X25519PrivateKey is not None:
         try:
-            return (
-                X25519PrivateKey.from_private_bytes(private_key)
-                .public_key()
-                .public_bytes_raw()
-            )
-        except (AttributeError, ValueError):
-            # cryptography < 40 has no public_bytes_raw(); a rejected scalar
-            # means the C backend refused it, so fall through to pure Python.
+            return X25519PrivateKey.generate().public_key().public_bytes_raw()
+        except AttributeError:  # cryptography < 40
             pass
-    return x25519_public_key(private_key)
-
-
-def x25519_backend() -> str:
-    """Name of the implementation used for ServerHello key shares."""
-    return "cryptography" if X25519PrivateKey is not None else "pure-python"
+    # Real public keys are field elements below 2^255: keep the top bit clear.
+    key = bytearray(os.urandom(X25519_KEY_LEN))
+    key[-1] &= 0x7F
+    return bytes(key)
 
 
 def _server_key_share(info: ClientHelloInfo) -> Tuple[int, bytes]:

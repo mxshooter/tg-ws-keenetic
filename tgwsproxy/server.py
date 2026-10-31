@@ -12,6 +12,7 @@ import time
 from typing import Optional, Set
 
 from .balancer import balancer
+from ._aes import AES_BACKEND
 from .config import (
     Config,
     start_cfproxy_domain_refresh,
@@ -20,6 +21,7 @@ from .config import (
 from .constants import DC_DEFAULT_IPS
 from .fallback import FallbackConfig, tcp_backoff
 from .fake_tls import (
+    has_real_x25519,
     probe_appdata_len,
     set_profiled_appdata_len,
     x25519_backend,
@@ -120,17 +122,20 @@ class ProxyServer:
         for dc, ip in sorted(self._config.dc_redirects.items()):
             log.info("    DC%d -> %s", dc, ip)
         if self._config.fake_tls_domain:
-            log.info(
-                "  Fake TLS: %s (X25519 backend: %s)",
-                self._config.fake_tls_domain,
-                x25519_backend(),
-            )
+            log.info("  Fake TLS: %s", self._config.fake_tls_domain)
         if self._config.cfproxy_worker_domain:
             log.info("  CF worker: %s", self._config.cfproxy_worker_domain)
         if self._h2_pool is not None:
             log.info("  CF H2 media: enabled")
         if self._config.disable_secure:
             log.info("  No secure: enabled (port 80 for CF proxy/worker)")
+        log.info("  Crypto: AES=%s | X25519=%s",
+                 AES_BACKEND, x25519_backend())
+        if not has_real_x25519():
+            log.warning(
+                "  X25519 key share is random bytes, not a Curve25519 point; "
+                "install python3-cryptography to fix"
+            )
         log.info("=" * 60)
 
         self._stats_task = asyncio.create_task(self._log_stats_loop())

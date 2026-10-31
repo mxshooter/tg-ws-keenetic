@@ -14,7 +14,6 @@ import asyncio
 import logging
 import random
 import struct
-import time
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -211,20 +210,15 @@ class ClientHandler:
             return None
 
         client_random, session_id, _ = verified
-        started = time.monotonic()
         server_hello = build_server_hello(
             self._settings.secret,
             client_random,
             session_id,
             parse_client_hello(client_hello),
         )
-        # A real TLS server never answers instantly. The jitter also hides the
-        # cost of generating a pure-Python X25519 key on slow routers.
-        remaining = random.uniform(*SERVER_HELLO_DELAY) - (
-            time.monotonic() - started
-        )
-        if remaining > 0:
-            await asyncio.sleep(remaining)
+        # A real TLS server never answers instantly; the jitter blunts
+        # "ServerHello latency == 0" DPI heuristics.
+        await asyncio.sleep(random.uniform(*SERVER_HELLO_DELAY))
         writer.write(server_hello)
         await writer.drain()
 

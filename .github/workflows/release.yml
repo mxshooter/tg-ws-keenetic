@@ -15,7 +15,7 @@ on:
       tag_name:
         description: "Release tag (e.g. v1.3.0). Version must match tgwsproxy/__init__.py"
         required: true
-        default: "v1.5.1"
+        default: "v1.5.2"
 
 permissions:
   contents: write
