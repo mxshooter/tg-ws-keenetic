@@ -30,6 +30,7 @@ from .fake_tls import (
     build_server_hello,
     parse_client_hello,
     relay_to_masking_domain,
+    replay_cache,
     verify_client_hello,
 )
 from .fallback import FallbackConfig, attempt_fallback
@@ -39,6 +40,11 @@ from .ws_pool import WebSocketPool, ws_domains_for
 from .constants import HANDSHAKE_LEN, TLS_RECORD_HANDSHAKE
 
 log = logging.getLogger("tgwsproxy.handler")
+
+# A client that keeps streaming after a rejected handshake would otherwise
+# keep a task and its socket alive forever.
+BAD_HANDSHAKE_DRAIN_TIMEOUT = 10.0
+BAD_HANDSHAKE_DRAIN_LIMIT = 64 * 1024
 
 
 @dataclass
@@ -93,7 +99,13 @@ class ClientHandler:
             if parsed is None:
                 self._stats.connections_bad += 1
                 log.warning("[%s] bad handshake (wrong secret or proto)", label)
-                await _drain(reader)
+                try:
+                    await asyncio.wait_for(
+                        _drain(reader),
+                        timeout=BAD_HANDSHAKE_DRAIN_TIMEOUT,
+                    )
+                except Exception:
+                    pass
                 return
 
             await self._serve_authenticated(
@@ -200,9 +212,17 @@ class ClientHandler:
 
         client_hello = tls_header + record_body
         verified = verify_client_hello(client_hello, self._settings.secret)
-        if verified is None:
+        # A recorded hello stays valid for minutes; answering it again would
+        # tell an active prober that this is a proxy, not the masking site.
+        replayed = (
+            verified is not None and not replay_cache.first_seen(verified[0])
+        )
+        if verified is None or replayed:
             log.debug(
-                "[%s] Fake TLS verify failed -> masking via %s", label, masking
+                "[%s] Fake TLS %s -> masking via %s",
+                label,
+                "hello replayed" if replayed else "verify failed",
+                masking,
             )
             await relay_to_masking_domain(
                 reader, writer, client_hello, masking, label
@@ -301,8 +321,17 @@ def _safe_splitter(proto_int: int) -> Optional[MessageSplitter]:
 
 
 async def _drain(reader) -> None:
+    """Discard what a rejected client still sends, bounded in size.
+
+    The caller also bounds the time spent here; without either bound a client
+    could hold the task and its socket open for as long as it wants.
+    """
+    remaining = BAD_HANDSHAKE_DRAIN_LIMIT
     try:
-        while await reader.read(4096):
-            pass
+        while remaining > 0:
+            chunk = await reader.read(min(4096, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
     except Exception:
         pass
