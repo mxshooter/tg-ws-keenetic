@@ -146,13 +146,13 @@ ssh -L 1434:127.0.0.1:1434 root@<router>
 | `secret` | hex(32) | MTProto-секрет, генерируется автоматически |
 | `dc_redirects` | dict | DC → IP, куда подключаемся для WS |
 | `buffer_size` | int | Размер SO_RCVBUF/SO_SNDBUF (для медленного ARM 64-256 KB) |
-| `pool_size` | int | Сколько WS-коннектов держать «горячими» на каждый DC |
+| `pool_size` | int | Сколько WS-коннектов держать «горячими» на каждый DC; `0` полностью выключает пулы, включая CF-воркер |
 | `cfproxy` | bool | Пытаться ли CF-проксированные домены при сбое прямого WS |
 | `cfproxy_user_domain` | str | Свой CF-домен (перебивает встроенный пул) |
 | `cfproxy_worker_domain` | str | Свой CF Worker URL (пробуется первым) |
 | `cfproxy_h2_media` | bool | Мультиплексировать медиа-трафик по HTTP/2 к CF (нужны `httpx`+`h2`) |
 | `disable_secure` | bool | CF-подключения по HTTP (порт 80) вместо TLS |
-| `fake_tls_domain` | str | SNI для Fake-TLS маскировки; пусто = выкл. На старте размер «заглушки» подстраивается под реальный сайт. |
+| `fake_tls_domain` | str | SNI для Fake-TLS маскировки; пусто = выкл. На старте размер «заглушки» подстраивается под реальный сайт. Повторно присланный ClientHello (запись + воспроизведение) не получает ServerHello — уходит в маскировочный домен. |
 | `proxy_protocol` | bool | Принимать PROXY protocol v1 (если за nginx/haproxy) |
 | `force_test_dc` | bool | Форсировать ВСЕ соединения на Telegram TEST датацентры |
 | `log_file`, `log_max_mb`, `log_backups` | | Ротация логов |

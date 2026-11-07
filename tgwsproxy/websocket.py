@@ -322,19 +322,22 @@ class RawWebSocket:
         return None
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        # The transport must be closed even when sending the close frame is
+        # cancelled or fails; otherwise the socket (and its fd) leaks.
         try:
-            self.writer.write(self._frame(WS_OP_CLOSE, b""))
-            await self.writer.drain()
-        except Exception:
-            pass
-        try:
-            self.writer.close()
-            await self.writer.wait_closed()
-        except Exception:
-            pass
+            if not self._closed:
+                self._closed = True
+                try:
+                    self.writer.write(self._frame(WS_OP_CLOSE, b""))
+                    await self.writer.drain()
+                except Exception:
+                    pass
+        finally:
+            try:
+                self.writer.close()
+                await self.writer.wait_closed()
+            except Exception:
+                pass
 
     @staticmethod
     def _frame(opcode: int, data: bytes) -> bytes:

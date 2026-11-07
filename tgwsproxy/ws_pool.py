@@ -306,22 +306,35 @@ class CfWorkerPool:
     """Idle-keep-alive pool for Cloudflare Worker endpoints (one per DC)."""
 
     MAX_AGE_SECONDS = 100.0
+    CHECK_INTERVAL = 5.0
     PER_DC_LIMIT = 1
+    REFILL_BACKOFF_INITIAL = 1.0
+    REFILL_BACKOFF_MAX = 3600.0
 
     def __init__(self, stats: Stats = stats):
         self._stats = stats
+        self._target = self.PER_DC_LIMIT
         self._idle: Dict[int, Deque[Tuple[RawWebSocket, float, str]]] = {}
         self._refilling: Dict[int, asyncio.Task] = {}
+        self._rotating: Dict[int, asyncio.Task] = {}
+        self._refill_failures: Dict[int, int] = {}
+        self._refill_after: Dict[int, float] = {}
         self._exhausted_until: Dict[str, float] = {}
+
+    def set_target(self, size: int) -> None:
+        """Keep at most PER_DC_LIMIT sockets per DC; 0 disables the pool."""
+        self._target = max(0, min(size, self.PER_DC_LIMIT))
 
     async def acquire(
         self, dc: int, fallback_dst: str, worker_domains: List[str]
     ) -> Optional[Tuple[RawWebSocket, str]]:
+        if self._target <= 0 or not worker_domains:
+            return None
         now = time.monotonic()
         bucket = self._idle.setdefault(dc, deque())
         while bucket:
             ws, created, worker_domain = bucket.popleft()
-            if now - created > self.MAX_AGE_SECONDS or ws.stale:
+            if now - created >= self.MAX_AGE_SECONDS or ws.stale:
                 asyncio.create_task(self._quiet_close(ws))
                 continue
             self._stats.cf_pool_hits += 1
@@ -329,12 +342,13 @@ class CfWorkerPool:
             return ws, worker_domain
 
         self._stats.cf_pool_misses += 1
+        self._schedule_refill(dc, fallback_dst, worker_domains)
         return None
 
     async def warmup(
         self, dc_to_fallback: Dict[int, str], worker_domains: List[str]
     ) -> None:
-        if not worker_domains:
+        if self._target <= 0 or not worker_domains:
             return
         domains = list(worker_domains)
         for dc, fallback_dst in dc_to_fallback.items():
@@ -343,7 +357,7 @@ class CfWorkerPool:
 
     def reset(self) -> None:
         loop = asyncio.get_running_loop()
-        for task in list(self._refilling.values()):
+        for task in list(self._rotating.values()) + list(self._refilling.values()):
             if not task.done() and task.get_loop() is loop:
                 task.cancel()
         for bucket in self._idle.values():
@@ -354,17 +368,26 @@ class CfWorkerPool:
                     pass
         self._idle.clear()
         self._refilling.clear()
+        self._rotating.clear()
+        self._refill_failures.clear()
+        self._refill_after.clear()
         self._exhausted_until.clear()
 
     async def close(self) -> None:
-        tasks = list(self._refilling.values())
+        tasks = list(self._rotating.values()) + list(self._refilling.values())
         self.reset()
         await asyncio.gather(*tasks, return_exceptions=True)
 
     def _schedule_refill(
         self, dc: int, fallback_dst: str, worker_domains: List[str]
     ) -> None:
-        if dc in self._refilling:
+        if self._target <= 0 or not worker_domains:
+            return
+        self._schedule_rotation(dc, fallback_dst, worker_domains)
+        if (
+            dc in self._refilling
+            or time.monotonic() < self._refill_after.get(dc, 0)
+        ):
             return
         self._refilling[dc] = asyncio.create_task(
             self._refill(dc, fallback_dst, list(worker_domains))
@@ -375,24 +398,99 @@ class CfWorkerPool:
     ) -> None:
         try:
             bucket = self._idle.setdefault(dc, deque())
-            needed = self.PER_DC_LIMIT - len(bucket)
+            needed = self._target - len(bucket)
             if needed <= 0:
                 return
+            connected = 0
             for _ in range(needed):
-                connected = await self._connect_one(
+                result = await self._connect_one(
                     worker_domains, fallback_dst, dc
                 )
-                if connected is None:
-                    break
-                ws, worker_domain = connected
                 if self._refilling.get(dc) is not asyncio.current_task():
-                    await self._quiet_close(ws)
+                    if result is not None:
+                        await self._quiet_close(result[0])
                     return
+                if result is None:
+                    break
+                ws, worker_domain = result
                 bucket.append((ws, time.monotonic(), worker_domain))
+                connected += 1
+            if connected:
+                self._refill_failures.pop(dc, None)
+                self._refill_after.pop(dc, None)
+            else:
+                failures = self._refill_failures.get(dc, 0) + 1
+                self._refill_failures[dc] = failures
+                delay = min(
+                    self.REFILL_BACKOFF_INITIAL
+                    * (2 ** min(failures - 1, 12)),
+                    self.REFILL_BACKOFF_MAX,
+                )
+                self._refill_after[dc] = time.monotonic() + delay
+                log.info(
+                    "CF worker pool refill failed for DC%d, retry in %.0fs",
+                    dc, delay,
+                )
             log.debug("CF worker pool refilled DC%d: %d ready", dc, len(bucket))
         finally:
             if self._refilling.get(dc) is asyncio.current_task():
                 self._refilling.pop(dc, None)
+
+    def _schedule_rotation(
+        self, dc: int, fallback_dst: str, worker_domains: List[str]
+    ) -> None:
+        if dc in self._rotating or self._target <= 0:
+            return
+        self._rotating[dc] = asyncio.create_task(
+            self._rotate(dc, fallback_dst, list(worker_domains))
+        )
+
+    async def _rotate(
+        self, dc: int, fallback_dst: str, worker_domains: List[str]
+    ) -> None:
+        try:
+            while self._target > 0:
+                bucket = self._idle.setdefault(dc, deque())
+                now = time.monotonic()
+                expired: List[RawWebSocket] = []
+                ready: Deque[Tuple[RawWebSocket, float, str]] = deque()
+                while bucket:
+                    ws, created, worker_domain = bucket.popleft()
+                    if now - created >= self.MAX_AGE_SECONDS or ws.stale:
+                        expired.append(ws)
+                    else:
+                        ready.append((ws, created, worker_domain))
+                bucket.extend(ready)
+
+                if expired:
+                    for ws in expired:
+                        asyncio.create_task(self._quiet_close(ws))
+                    log.debug(
+                        "CF worker pool rotated DC%d: %d stale, %d ready",
+                        dc, len(expired), len(bucket),
+                    )
+
+                if len(bucket) < self._target:
+                    self._schedule_refill(dc, fallback_dst, worker_domains)
+
+                wake_at = now + self.CHECK_INTERVAL
+                if bucket:
+                    wake_at = min(
+                        wake_at,
+                        min(
+                            created + self.MAX_AGE_SECONDS
+                            for _, created, _ in bucket
+                        ),
+                    )
+                if (
+                    dc not in self._refilling
+                    and self._refill_after.get(dc, 0) > now
+                ):
+                    wake_at = min(wake_at, self._refill_after[dc])
+                await asyncio.sleep(max(0, wake_at - time.monotonic()))
+        finally:
+            if self._rotating.get(dc) is asyncio.current_task():
+                self._rotating.pop(dc, None)
 
     async def _connect_one(
         self, worker_domains: List[str], fallback_dst: str, dc: int
@@ -407,6 +505,10 @@ class CfWorkerPool:
                 )
                 return ws, worker_domain
             except Exception as exc:
+                log.debug(
+                    "CF worker pool connect DC%d via %s for %s failed: %r",
+                    dc, worker_domain, fallback_dst, exc,
+                )
                 self.report_failure(worker_domain, exc)
         return None
 

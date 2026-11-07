@@ -96,6 +96,8 @@ class ProxyServer:
             buffer_size=self._config.buffer_size,
             stats=stats,
         )
+        # pool_size == 0 disables pooling everywhere, the CF worker included.
+        cf_worker_pool.set_target(self._config.pool_size)
         self._h2_pool = _make_h2_pool(self._config)
         self._handler = ClientHandler(
             settings=self._build_handler_settings(),
