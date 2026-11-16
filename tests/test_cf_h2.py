@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 try:
     import httpx
+    import h2  # noqa: F401
 except ImportError as exc:  # optional on the router
     raise unittest.SkipTest("httpx + h2 are required for cf_h2 tests") from exc
 
