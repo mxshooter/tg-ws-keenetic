@@ -37,11 +37,12 @@ from pathlib import Path
 from typing import Optional
 
 from . import __version__
+from .config import DEFAULT_UPDATE_REPO
 
 log = logging.getLogger("tgwsproxy.updater")
 
 GITHUB_API_BASE = "https://api.github.com"
-DEFAULT_REPO = "Omn1z/tg-ws-keenetic"
+DEFAULT_REPO = DEFAULT_UPDATE_REPO
 DEFAULT_INSTALL_ROOT = "/opt/share/tgwsproxy"
 DEFAULT_INIT_SCRIPT = "/opt/etc/init.d/S99tgwsproxy"
 USER_AGENT = f"tgwsproxy-updater/{__version__}"
@@ -272,8 +273,33 @@ log() {{ echo "[$(date '+%H:%M:%S')] $*" >> "$LOG"; }}
 
 log "update apply: staging=$STAGING install=$INSTALL"
 
+# Put the previous payload back and bring the service up again. Used for any
+# failure that happens after the service has been stopped.
+fail_after_stop() {{
+    log "ERROR: $* — restoring previous version"
+    for r in $PAYLOAD; do
+        rm -rf "$INSTALL/$r"
+        [ -d "$BACKUP/$r" ] && mv "$BACKUP/$r" "$INSTALL/$r"
+    done
+    if [ -x "$INIT" ]; then
+        "$INIT" start >> "$LOG" 2>&1 || log "restart after rollback failed"
+    fi
+    rm -rf "$STAGING"
+    exit 1
+}}
+
 # Give the HTTP response a chance to reach the client.
 sleep 2
+
+# Never stop the service unless the new payload can actually be installed
+# (read-only /opt, full filesystem, etc.). Checking before `stop` keeps a
+# failed update from leaving the router without a working proxy.
+if ! ( : > "$INSTALL/.tgwsproxy-update-probe" ) 2>/dev/null; then
+    log "ERROR: $INSTALL is not writable; update aborted, service left running"
+    rm -rf "$STAGING"
+    exit 1
+fi
+rm -f "$INSTALL/.tgwsproxy-update-probe"
 
 if [ -x "$INIT" ]; then
     log "stopping service via $INIT"
@@ -283,10 +309,10 @@ fi
 # Backup current code.
 TS=$(date +%Y%m%d-%H%M%S)
 BACKUP="$INSTALL/.backup-$TS"
-mkdir -p "$BACKUP"
+mkdir -p "$BACKUP" || fail_after_stop "cannot create $BACKUP"
 for d in $PAYLOAD; do
     if [ -d "$INSTALL/$d" ]; then
-        mv "$INSTALL/$d" "$BACKUP/$d"
+        mv "$INSTALL/$d" "$BACKUP/$d" || fail_after_stop "cannot back up $d"
     fi
 done
 log "backup created at $BACKUP"
@@ -294,16 +320,10 @@ log "backup created at $BACKUP"
 # Move new code into place.
 for d in $PAYLOAD; do
     if [ -d "$STAGING/$d" ]; then
-        mv "$STAGING/$d" "$INSTALL/$d"
+        mv "$STAGING/$d" "$INSTALL/$d" || fail_after_stop "cannot install $d"
         log "installed new $d"
     else
-        log "ERROR: staging missing $d, rolling back"
-        for r in $PAYLOAD; do
-            rm -rf "$INSTALL/$r"
-            [ -d "$BACKUP/$r" ] && mv "$BACKUP/$r" "$INSTALL/$r"
-        done
-        "$INIT" start >> "$LOG" 2>&1 || true
-        exit 1
+        fail_after_stop "staging missing $d"
     fi
 done
 
@@ -345,6 +365,27 @@ class PreparedUpdate:
     log_file: Path
 
 
+def _probe_writable(directory: Path) -> bool:
+    """Whether a file can be created and removed in `directory`.
+
+    os.access() is not used: it ignores ACLs, so on a read-only install dir
+    the update would only fail after the service had already been stopped.
+    """
+    probe = directory / f".tgwsproxy-update-probe-{os.getpid()}"
+    try:
+        fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except OSError:
+        return False
+    try:
+        os.close(fd)
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+    return True
+
+
 def prepare_update(
     info: UpdateInfo,
     *,
@@ -360,6 +401,15 @@ def prepare_update(
     """
     if not info.tarball_url:
         raise UpdateError("no tarball_url in update info")
+
+    install_path = Path(install_root)
+    if not install_path.is_dir():
+        raise UpdateError(f"install root {install_path} does not exist")
+    if not _probe_writable(install_path):
+        raise UpdateError(
+            f"no write access to {install_path}; update aborted before the "
+            "service is stopped"
+        )
 
     staging = Path(staging_root) / f"tgwsproxy-update-{int(time.time())}"
     staging.mkdir(parents=True, exist_ok=True)
