@@ -32,6 +32,13 @@
 
     let lastConfig = null;
 
+    // Config keys that hold a list of domains. The UI edits them as one
+    // comma-separated line so a single text input is enough.
+    const DOMAIN_LIST_FIELDS = new Set([
+        'cfproxy_user_domains',
+        'cfproxy_worker_domains',
+    ]);
+
     // In-memory log polling state.
     let logSession = null;
     let logCursor = 0;
@@ -116,6 +123,8 @@
             } else if (name === 'dc_redirects') {
                 field.value = Object.entries(value)
                     .map(([dc, ip]) => `${dc}: ${ip}`).join('\n');
+            } else if (DOMAIN_LIST_FIELDS.has(name)) {
+                field.value = Array.isArray(value) ? value.join(', ') : '';
             } else {
                 field.value = value == null ? '' : value;
             }
@@ -130,6 +139,11 @@
                 data[el.name] = el.checked;
             } else if (el.name === 'dc_redirects') {
                 data[el.name] = parseDcMap(el.value);
+            } else if (DOMAIN_LIST_FIELDS.has(el.name)) {
+                data[el.name] = el.value
+                    .split(/[,\s;]+/)
+                    .map((item) => item.trim())
+                    .filter(Boolean);
             } else if (el.type === 'number') {
                 data[el.name] = el.value === '' ? 0 : Number(el.value);
             } else {

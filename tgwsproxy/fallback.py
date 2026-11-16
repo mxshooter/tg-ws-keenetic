@@ -1,7 +1,7 @@
 """Fallback strategies when the primary WSS path to Telegram is down.
 
 Order of attempts is decided here based on what is enabled in config:
-  1. Cloudflare Worker (if `cfproxy_worker_domain` set)
+  1. Cloudflare Worker (if `cfproxy_worker_domains` is not empty)
   2. Cloudflare proxied domain pool (if `cfproxy` enabled)
   3. Direct TCP to the DC default IP on :443
 
@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Dict, Optional, Set, Tuple
+from typing import Dict, Iterable, Optional, Set, Tuple
 from urllib.parse import urlencode
 
 from .balancer import balancer
@@ -76,16 +76,22 @@ tcp_backoff = _TcpBackoff()
 class FallbackConfig:
     """Bundles the few flags that influence fallback selection."""
 
-    __slots__ = ("cfproxy_enabled", "cfproxy_worker_domain", "disable_secure")
+    __slots__ = ("cfproxy_enabled", "cfproxy_worker_domains", "disable_secure")
 
     def __init__(
         self,
         cfproxy_enabled: bool,
-        cfproxy_worker_domain: str,
+        cfproxy_worker_domains: Iterable[str] = (),
         disable_secure: bool = False,
     ):
+        # Tolerate a bare string so older callers keep working; the list is
+        # what all fallback code iterates over.
+        if isinstance(cfproxy_worker_domains, str):
+            cfproxy_worker_domains = [cfproxy_worker_domains]
         self.cfproxy_enabled = cfproxy_enabled
-        self.cfproxy_worker_domain = cfproxy_worker_domain
+        self.cfproxy_worker_domains = [
+            domain for domain in cfproxy_worker_domains if domain
+        ]
         self.disable_secure = disable_secure
 
 
@@ -109,7 +115,7 @@ async def attempt_fallback(
     target_ip = ip_table.get(dc)
     media_tag = " media" if is_media else ""
 
-    if cfg.cfproxy_worker_domain and target_ip and not is_test_dc:
+    if cfg.cfproxy_worker_domains and target_ip and not is_test_dc:
         if await _cfworker(
             client_reader,
             client_writer,
@@ -181,7 +187,7 @@ async def _cfworker(
     splitter,
 ) -> bool:
     media_tag = " media" if is_media else ""
-    worker_domains = [cfg.cfproxy_worker_domain]
+    worker_domains = list(cfg.cfproxy_worker_domains)
     secure = not cfg.disable_secure
 
     pooled = await cf_worker_pool.acquire(dc, target_ip, worker_domains)

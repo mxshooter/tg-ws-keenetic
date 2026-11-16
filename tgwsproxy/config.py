@@ -95,6 +95,14 @@ DEFAULT_UPDATE_REPO = "mxshooter/tg-ws-keenetic"
 # still point there are migrated on load.
 _LEGACY_UPDATE_REPOS = frozenset({"omn1z/tg-ws-keenetic"})
 
+# Pre-1.7 configs kept a single CF domain per field. They are folded into
+# the plural list fields on load; `save_config` then persists them in the
+# new shape, so the migration only runs once.
+_LEGACY_DOMAIN_KEYS = {
+    "cfproxy_user_domain": "cfproxy_user_domains",
+    "cfproxy_worker_domain": "cfproxy_worker_domains",
+}
+
 
 def build_https_context() -> ssl.SSLContext:
     """TLS context for outbound GitHub/Cloudflare requests (certificates checked).
@@ -242,8 +250,11 @@ class Config:
 
     # Cloudflare-based fallback
     cfproxy: bool = True
-    cfproxy_user_domain: str = ""
-    cfproxy_worker_domain: str = ""
+    # Base domains for the CF-proxied pool (kws<N>.<domain>) and Worker
+    # endpoints. Several entries are tried in turn; the first working one is
+    # pinned for that DC.
+    cfproxy_user_domains: List[str] = field(default_factory=list)
+    cfproxy_worker_domains: List[str] = field(default_factory=list)
     # Multiplex media traffic over HTTP/2 to the CF worker (needs httpx+h2).
     cfproxy_h2_media: bool = True
     # Use plain HTTP (port 80) for CF proxy/worker connections.
@@ -322,6 +333,12 @@ class Config:
             )
         if self.update_repo and "/" not in self.update_repo:
             errors.append("update_repo must look like 'owner/name'")
+        for domain in self.cfproxy_user_domains:
+            if not _is_valid_domain(domain):
+                errors.append(f"invalid CF proxy domain: {domain!r}")
+        for domain in self.cfproxy_worker_domains:
+            if not _is_valid_domain(domain):
+                errors.append(f"invalid CF worker domain: {domain!r}")
         return errors
 
     def to_dict(self) -> Dict[str, Any]:
@@ -374,6 +391,7 @@ def save_config(cfg: Config, path: str = DEFAULT_CONFIG_PATH) -> None:
 
 def _from_dict(raw: Dict[str, Any]) -> Config:
     """Build a Config out of an untrusted dict — tolerant of missing keys."""
+    raw = _migrate_legacy_keys(raw)
     base = default_config()
     merged = copy.deepcopy(asdict(base))
 
@@ -397,8 +415,10 @@ def _from_dict(raw: Dict[str, Any]) -> Config:
         proxy_protocol=bool(merged["proxy_protocol"]),
         force_test_dc=bool(merged["force_test_dc"]),
         cfproxy=bool(merged["cfproxy"]),
-        cfproxy_user_domain=str(merged["cfproxy_user_domain"]),
-        cfproxy_worker_domain=str(merged["cfproxy_worker_domain"]),
+        cfproxy_user_domains=_coerce_domain_list(merged["cfproxy_user_domains"]),
+        cfproxy_worker_domains=_coerce_domain_list(
+            merged["cfproxy_worker_domains"]
+        ),
         cfproxy_h2_media=bool(merged["cfproxy_h2_media"]),
         disable_secure=bool(merged["disable_secure"]),
         fake_tls_domain=str(merged["fake_tls_domain"]),
@@ -427,6 +447,47 @@ def _migrate_update_repo(raw: Any) -> str:
         )
         return DEFAULT_UPDATE_REPO
     return repo
+
+
+def _migrate_legacy_keys(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Fold singular CF domain keys from old configs into the list fields."""
+    migrated = dict(raw)
+    for old, new in _LEGACY_DOMAIN_KEYS.items():
+        if old not in migrated:
+            continue
+        value = migrated.pop(old)
+        # An explicitly set plural value wins; the singular one is only a
+        # fallback for configs written by an older version.
+        if migrated.get(new):
+            continue
+        migrated[new] = value
+        log.info("Migrating config key %s -> %s", old, new)
+    return migrated
+
+
+def _coerce_domain_list(raw: Any) -> List[str]:
+    """Accept a list or a `,`/`;`/whitespace separated string of domains."""
+    if isinstance(raw, str):
+        items = raw.replace(",", " ").replace(";", " ").split()
+    elif isinstance(raw, (list, tuple)):
+        items = []
+        for entry in raw:
+            if isinstance(entry, str):
+                items.extend(
+                    entry.replace(",", " ").replace(";", " ").split()
+                )
+    else:
+        return []
+
+    seen = set()
+    domains: List[str] = []
+    for item in items:
+        domain = item.strip()
+        if not domain or domain.lower() in seen:
+            continue
+        seen.add(domain.lower())
+        domains.append(domain)
+    return domains
 
 
 def _coerce_dc_map(raw: Any) -> Dict[int, str]:
