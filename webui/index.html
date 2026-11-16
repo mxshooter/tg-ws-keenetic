@@ -100,11 +100,11 @@
                     <input name="fake_tls_domain" type="text" placeholder="example.com" />
                 </label>
                 <label><input name="cfproxy" type="checkbox" /> Использовать публичный пул CF-доменов</label>
-                <label>Пользовательский CF-домен
-                    <input name="cfproxy_user_domain" type="text" placeholder="my.example.com" />
+                <label>Пользовательские CF-домены
+                    <input name="cfproxy_user_domains" type="text" placeholder="my.example.com, backup.example.com" />
                 </label>
-                <label>CF Worker домен
-                    <input name="cfproxy_worker_domain" type="text" placeholder="my-worker.workers.dev" />
+                <label>CF Worker домены
+                    <input name="cfproxy_worker_domains" type="text" placeholder="my-worker.workers.dev, backup.workers.dev" />
                 </label>
                 <label><input name="cfproxy_h2_media" type="checkbox" /> HTTP/2 мультиплексирование медиа (требует httpx+h2)</label>
                 <label><input name="disable_secure" type="checkbox" /> CF-подключения по HTTP (порт 80, без TLS)</label>
@@ -118,6 +118,7 @@
                 <label>Размер ротации, MB <input name="log_max_mb" type="number" min="0.5" step="0.5" /></label>
                 <label>Кол-во ротированных файлов <input name="log_backups" type="number" min="0" /></label>
                 <label><input name="verbose" type="checkbox" /> Подробное логирование (DEBUG)</label>
+                <label><input name="force_test_dc" type="checkbox" /> Форсировать тестовые DC Telegram</label>
                 <label><input name="proxy_protocol" type="checkbox" /> PROXY protocol v1 (за nginx/haproxy)</label>
             </fieldset>
 

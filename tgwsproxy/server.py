@@ -82,11 +82,11 @@ class ProxyServer:
             return
         self._stop_event = asyncio.Event()
 
-        if self._config.cfproxy and not self._config.cfproxy_user_domain:
+        if self._config.cfproxy and not self._config.cfproxy_user_domains:
             balancer.update_domains_list(self._config.cfproxy_default_pool())
             start_cfproxy_domain_refresh(user_overridden=False)
-        elif self._config.cfproxy_user_domain:
-            balancer.update_domains_list([self._config.cfproxy_user_domain])
+        elif self._config.cfproxy_user_domains:
+            balancer.update_domains_list(self._config.cfproxy_user_domains)
 
         tcp_backoff.reset()
         self._stopping = False
@@ -125,8 +125,10 @@ class ProxyServer:
             log.info("    DC%d -> %s", dc, ip)
         if self._config.fake_tls_domain:
             log.info("  Fake TLS: %s", self._config.fake_tls_domain)
-        if self._config.cfproxy_worker_domain:
-            log.info("  CF worker: %s", self._config.cfproxy_worker_domain)
+        if self._config.cfproxy_worker_domains:
+            log.info(
+                "  CF worker: %s", ", ".join(self._config.cfproxy_worker_domains)
+            )
         if self._h2_pool is not None:
             log.info("  CF H2 media: enabled")
         if self._config.disable_secure:
@@ -143,13 +145,16 @@ class ProxyServer:
         self._stats_task = asyncio.create_task(self._log_stats_loop())
         await self._pool.warmup(self._config.dc_redirects)
 
-        if self._config.cfproxy_worker_domain and not self._config.force_test_dc:
+        if (
+            self._config.cfproxy_worker_domains
+            and not self._config.force_test_dc
+        ):
             cf_fallbacks = {
                 dc: ip for dc, ip in DC_DEFAULT_IPS.items()
                 if dc not in self._config.dc_redirects
             }
             await cf_worker_pool.warmup(
-                cf_fallbacks, [self._config.cfproxy_worker_domain]
+                cf_fallbacks, self._config.cfproxy_worker_domains
             )
 
         self._serve_task = asyncio.create_task(self._serve_forever())
@@ -258,7 +263,9 @@ class ProxyServer:
             force_test_dc=self._config.force_test_dc,
             fallback=FallbackConfig(
                 cfproxy_enabled=self._config.cfproxy,
-                cfproxy_worker_domain=self._config.cfproxy_worker_domain,
+                cfproxy_worker_domains=list(
+                    self._config.cfproxy_worker_domains
+                ),
                 disable_secure=self._config.disable_secure,
             ),
         )
