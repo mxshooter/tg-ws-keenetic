@@ -53,6 +53,53 @@ else
     warn "  To enable: pip3 install 'httpx[http2]' (or opkg install python3-httpx python3-h2)"
 fi
 
+# Self-update and the CF domain refresh talk to GitHub over verified HTTPS.
+# Entware does not always ship a CA bundle, and without one those features
+# fail with a certificate error; try to install one now.
+bold "Checking CA certificates (needed for self-update)..."
+CA_STATUS=$("$PYTHON_BIN" - <<'PY' 2>/dev/null || true
+import ssl
+import urllib.error
+import urllib.request
+try:
+    urllib.request.urlopen("https://api.github.com", timeout=5).close()
+except urllib.error.URLError as exc:
+    if isinstance(getattr(exc, "reason", None), ssl.SSLCertVerificationError):
+        print("no-ca")
+    else:
+        print("offline")
+except Exception:
+    print("offline")
+else:
+    print("ok")
+PY
+)
+case "$CA_STATUS" in
+    ok)
+        ok "HTTPS to GitHub works"
+        ;;
+    no-ca)
+        warn "No usable CA bundle: web self-update will fail with a TLS error."
+        if command -v opkg >/dev/null 2>&1; then
+            warn "Trying to install ca-certificates..."
+            opkg install ca-certificates >/dev/null 2>&1 \
+                || opkg install ca-bundle >/dev/null 2>&1 \
+                || true
+        fi
+        if "$PYTHON_BIN" -c 'import ssl,urllib.request; urllib.request.urlopen("https://api.github.com", timeout=5).close()' >/dev/null 2>&1; then
+            ok "CA bundle installed"
+        else
+            warn "Still no trusted CA; install one manually:"
+            warn "  opkg install ca-certificates   (or: pip3 install certifi)"
+            warn "The proxy itself keeps working; only in-app updates are affected."
+        fi
+        ;;
+    *)
+        warn "GitHub is unreachable; skipping the CA check (proxy still works)."
+        warn "Self-update needs outbound HTTPS to api.github.com."
+        ;;
+esac
+
 bold "Creating directories..."
 mkdir -p "$INSTALL_ROOT" "$CONFIG_DIR" "$LOG_DIR" "$RUN_DIR"
 ok "Directories ready"

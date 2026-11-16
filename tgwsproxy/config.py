@@ -17,6 +17,7 @@ import os
 import random
 import secrets
 import socket as _socket
+import ssl
 import string
 import threading
 import urllib.request
@@ -84,6 +85,31 @@ CFPROXY_DEFAULT_DOMAINS: List[str] = [
     _decode_cfproxy(d) for d in _CFPROXY_ENCODED_DEFAULTS
 ]
 
+# Repo the self-updater pulls releases from. This must stay on the Python
+# Keenetic fork: the parent project moved to a Rust rewrite whose release
+# tarballs have no `tgwsproxy/` payload and cannot be installed here.
+DEFAULT_UPDATE_REPO = "mxshooter/tg-ws-keenetic"
+
+# Defaults that shipped in older versions. The parent repo used to be a valid
+# update source, but now it only publishes Rust releases, so configs that
+# still point there are migrated on load.
+_LEGACY_UPDATE_REPOS = frozenset({"omn1z/tg-ws-keenetic"})
+
+
+def build_https_context() -> ssl.SSLContext:
+    """TLS context for outbound GitHub/Cloudflare requests (certificates checked).
+
+    Entware images often ship without a CA bundle. Prefer `certifi` when it is
+    installed (`pip3 install certifi`); otherwise use the system store, which
+    needs `opkg install ca-certificates` to work.
+    """
+    try:
+        import certifi  # type: ignore
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
 
 def _is_valid_domain(domain: str) -> bool:
     if not domain or len(domain) > 253:
@@ -126,7 +152,9 @@ def _fetch_cfproxy_domain_list(user_overridden: bool) -> List[str]:
             random.choices(string.ascii_letters, k=7)
         )
         req = urllib.request.Request(url, headers={"User-Agent": "tg-ws-keenetic"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(
+            req, timeout=10, context=build_https_context()
+        ) as resp:
             text = resp.read().decode("utf-8", errors="replace")
         encoded = [
             line.strip() for line in text.splitlines()
@@ -230,7 +258,7 @@ class Config:
     link_host: str = ""
 
     # Self-update settings
-    update_repo: str = "Omn1z/tg-ws-keenetic"
+    update_repo: str = DEFAULT_UPDATE_REPO
     update_channel: str = "release"  # "release" (tag-based) | "main" (rolling)
 
     # Logging
@@ -375,7 +403,7 @@ def _from_dict(raw: Dict[str, Any]) -> Config:
         disable_secure=bool(merged["disable_secure"]),
         fake_tls_domain=str(merged["fake_tls_domain"]),
         link_host=str(merged["link_host"]),
-        update_repo=str(merged["update_repo"]),
+        update_repo=_migrate_update_repo(merged["update_repo"]),
         update_channel=str(merged["update_channel"]),
         log_file=str(merged["log_file"]),
         log_max_mb=float(merged["log_max_mb"]),
@@ -386,6 +414,19 @@ def _from_dict(raw: Dict[str, Any]) -> Config:
     )
     cfg.ensure_secret()
     return cfg
+
+
+def _migrate_update_repo(raw: Any) -> str:
+    """Normalise the updater repo and rewrite the obsolete parent default."""
+    repo = str(raw).strip()
+    if not repo:
+        return DEFAULT_UPDATE_REPO
+    if repo.lower() in _LEGACY_UPDATE_REPOS:
+        log.info(
+            "Migrating update_repo %s -> %s", repo, DEFAULT_UPDATE_REPO
+        )
+        return DEFAULT_UPDATE_REPO
+    return repo
 
 
 def _coerce_dc_map(raw: Any) -> Dict[int, str]:

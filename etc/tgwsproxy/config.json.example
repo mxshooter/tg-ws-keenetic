@@ -19,7 +19,7 @@
   "disable_secure": false,
   "fake_tls_domain": "",
   "link_host": "",
-  "update_repo": "Omn1z/tg-ws-keenetic",
+  "update_repo": "mxshooter/tg-ws-keenetic",
   "update_channel": "release",
   "log_file": "/opt/var/log/tgwsproxy/tgwsproxy.log",
   "log_max_mb": 5.0,
