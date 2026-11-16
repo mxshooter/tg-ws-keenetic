@@ -159,6 +159,17 @@ ssh -L 1434:127.0.0.1:1434 root@<router>
 | `verbose` | bool | DEBUG-логи (шумно) |
 | `web_user`, `web_password` | str | Basic Auth для веб-UI; пустой пароль = выкл. |
 
+## Документация
+
+- [Cloudflare Worker](./docs/RU/CfWorker.md) — бесплатный запасной путь без
+  своего домена.
+- [Cloudflare-прокси](./docs/RU/CfProxy.md) — свой домен и записи `kws*`,
+  HTTP/2-мультиплексирование медиа.
+- [Тестовые DC Telegram](./docs/RU/TestDc.md) — тестовое окружение и
+  `force_test_dc`.
+- [Fake TLS за nginx](./docs/RU/FakeTlsNginx.md) — `ssl_preread`, PROXY
+  protocol и `ee`-ссылка.
+
 ## Удаление
 
 ```sh
