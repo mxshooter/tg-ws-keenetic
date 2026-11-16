@@ -219,6 +219,11 @@ tail -f /opt/var/log/tgwsproxy/update.log
 Канал и репозиторий настраиваются в Web UI (раздел «Обновления») или в
 `config.json` через поля `update_repo` и `update_channel`.
 
+> Для HTTPS к GitHub нужны CA-сертификаты: `opkg install ca-certificates`
+> (или `pip3 install certifi`). `scripts/install.sh` проверяет это и
+> пытается поставить пакет; без них веб-обновление вернёт ошибку TLS,
+> а прокси продолжит работать.
+
 ### Для разработчиков: как выпустить новую версию
 
 В репозитории настроен GitHub Action, который при пуше тега `vX.Y.Z`

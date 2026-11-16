@@ -17,6 +17,7 @@ import os
 import random
 import secrets
 import socket as _socket
+import ssl
 import string
 import threading
 import urllib.request
@@ -95,6 +96,21 @@ DEFAULT_UPDATE_REPO = "mxshooter/tg-ws-keenetic"
 _LEGACY_UPDATE_REPOS = frozenset({"omn1z/tg-ws-keenetic"})
 
 
+def build_https_context() -> ssl.SSLContext:
+    """TLS context for outbound GitHub/Cloudflare requests (certificates checked).
+
+    Entware images often ship without a CA bundle. Prefer `certifi` when it is
+    installed (`pip3 install certifi`); otherwise use the system store, which
+    needs `opkg install ca-certificates` to work.
+    """
+    try:
+        import certifi  # type: ignore
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
 def _is_valid_domain(domain: str) -> bool:
     if not domain or len(domain) > 253:
         return False
@@ -136,7 +152,9 @@ def _fetch_cfproxy_domain_list(user_overridden: bool) -> List[str]:
             random.choices(string.ascii_letters, k=7)
         )
         req = urllib.request.Request(url, headers={"User-Agent": "tg-ws-keenetic"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(
+            req, timeout=10, context=build_https_context()
+        ) as resp:
             text = resp.read().decode("utf-8", errors="replace")
         encoded = [
             line.strip() for line in text.splitlines()

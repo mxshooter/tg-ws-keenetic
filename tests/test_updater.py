@@ -7,16 +7,21 @@ Run with::
 from __future__ import annotations
 
 import os
+import ssl
 import stat
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest.mock import patch
 
+from tgwsproxy.config import build_https_context
 from tgwsproxy.updater import (
     DEFAULT_REPO,
     UpdateError,
     UpdateInfo,
     _generate_apply_script,
+    _http_get,
     _probe_writable,
     prepare_update,
 )
@@ -37,6 +42,34 @@ def _info() -> UpdateInfo:
 class UpdateRepoTest(unittest.TestCase):
     def test_default_repo_is_the_keenetic_fork(self):
         self.assertEqual(DEFAULT_REPO, "mxshooter/tg-ws-keenetic")
+
+
+class HttpsTest(unittest.TestCase):
+    def test_outbound_context_verifies_certificates(self):
+        ctx = build_https_context()
+        self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(ctx.check_hostname)
+
+    def test_certificate_error_explains_how_to_fix_it(self):
+        error = ssl.SSLCertVerificationError(1, "certificate verify failed")
+        with patch(
+            "tgwsproxy.updater.urllib.request.urlopen",
+            side_effect=urllib.error.URLError(error),
+        ):
+            with self.assertRaises(UpdateError) as ctx:
+                _http_get("https://api.github.com/repos/x/y")
+        message = str(ctx.exception)
+        self.assertIn("ca-certificates", message)
+        self.assertIn("certifi", message)
+
+    def test_network_error_is_reported_as_is(self):
+        with patch(
+            "tgwsproxy.updater.urllib.request.urlopen",
+            side_effect=urllib.error.URLError(OSError("boom")),
+        ):
+            with self.assertRaises(UpdateError) as ctx:
+                _http_get("https://api.github.com/repos/x/y")
+        self.assertIn("network error", str(ctx.exception))
 
 
 class ProbeWritableTest(unittest.TestCase):

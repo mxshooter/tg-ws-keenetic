@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import __version__
-from .config import DEFAULT_UPDATE_REPO
+from .config import DEFAULT_UPDATE_REPO, build_https_context
 
 log = logging.getLogger("tgwsproxy.updater")
 
@@ -92,7 +92,7 @@ def _http_get(url: str, *, timeout: float = 15.0,
     req = urllib.request.Request(
         url, headers={"User-Agent": USER_AGENT, "Accept": accept}
     )
-    ctx = ssl.create_default_context()
+    ctx = build_https_context()
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
             return resp.read()
@@ -102,6 +102,12 @@ def _http_get(url: str, *, timeout: float = 15.0,
             f"GitHub returned HTTP {exc.code} for {url}: {body}"
         ) from exc
     except urllib.error.URLError as exc:
+        if isinstance(getattr(exc, "reason", None), ssl.SSLCertVerificationError):
+            raise UpdateError(
+                f"TLS certificate check failed for {url}: {exc.reason}. "
+                "Install CA certificates (opkg install ca-certificates) or "
+                "certifi (pip3 install certifi) to enable self-update."
+            ) from exc
         raise UpdateError(f"network error fetching {url}: {exc.reason}") from exc
 
 
