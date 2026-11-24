@@ -18,10 +18,11 @@ from urllib.parse import urlencode
 
 from .balancer import balancer
 from .bridge import MessageSplitter, bridge_tcp, bridge_ws
+from .client_guard import client_setup
 from .constants import DC_DEFAULT_IPS, DC_TEST_IPS
 from .crypto import ReencryptionContext
 from .stats import Stats
-from .websocket import RawWebSocket
+from .websocket import RawWebSocket, connect_cf_domains, wait_close
 from .ws_pool import cf_worker_pool
 
 log = logging.getLogger("tgwsproxy.fallback")
@@ -115,60 +116,82 @@ async def attempt_fallback(
     target_ip = ip_table.get(dc)
     media_tag = " media" if is_media else ""
 
+    # A dead method must not abort the whole client connection: log it and
+    # let the next (cheaper) fallback try. Cancellation still propagates.
     if cfg.cfproxy_worker_domains and target_ip and not is_test_dc:
-        if await _cfworker(
-            client_reader,
-            client_writer,
-            relay_init,
-            label,
-            dc,
-            is_media,
-            target_ip,
-            ctx,
-            stats,
-            cfg,
-            splitter,
-        ):
-            return True
+        try:
+            if await _cfworker(
+                client_reader,
+                client_writer,
+                relay_init,
+                label,
+                dc,
+                is_media,
+                target_ip,
+                ctx,
+                stats,
+                cfg,
+                splitter,
+            ):
+                return True
+        except Exception as exc:
+            log.warning("[%s] DC%d%s CF worker fallback failed: %r",
+                        label, dc, media_tag, exc)
 
     if cfg.cfproxy_enabled and not is_test_dc:
         # Media traffic can be multiplexed over HTTP/2 to the CF proxy, which
         # is far cheaper than one WS connection per stream.
         if is_media and h2_pool is not None and proto_tag is not None:
-            channel = await h2_pool.open(dc, label)
+            try:
+                with client_setup(client_reader, client_writer):
+                    channel = await h2_pool.open(dc, label)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("[%s] DC%d%s CF H2 open failed: %r",
+                            label, dc, media_tag, exc)
+                channel = None
             if channel is not None:
                 stats.connections_h2 += 1
                 stats.connections_cfproxy += 1
                 from .cf_h2 import bridge_h2
                 await bridge_h2(client_reader, client_writer, channel, ctx, proto_tag)
                 return True
-        if await _cfproxy(
-            client_reader,
-            client_writer,
-            relay_init,
-            label,
-            dc,
-            is_media,
-            ctx,
-            stats,
-            cfg,
-            splitter,
-        ):
-            return True
+        try:
+            if await _cfproxy(
+                client_reader,
+                client_writer,
+                relay_init,
+                label,
+                dc,
+                is_media,
+                ctx,
+                stats,
+                cfg,
+                splitter,
+            ):
+                return True
+        except Exception as exc:
+            log.warning("[%s] DC%d%s CF proxy fallback failed: %r",
+                        label, dc, media_tag, exc)
 
     if target_ip:
-        if await _tcp(
-            client_reader,
-            client_writer,
-            target_ip,
-            relay_init,
-            label,
-            dc,
-            media_tag,
-            ctx,
-            stats,
-        ):
-            return True
+        try:
+            if await _tcp(
+                client_reader,
+                client_writer,
+                target_ip,
+                relay_init,
+                label,
+                dc,
+                media_tag,
+                ctx,
+                stats,
+            ):
+                return True
+        except Exception as exc:
+            log.warning("[%s] DC%d%s TCP fallback failed: %r",
+                        label, dc, media_tag, exc)
 
     return False
 
@@ -203,10 +226,11 @@ async def _cfworker(
             log.info("[%s] DC%d%s -> CF worker %s for %s",
                      label, dc, media_tag, worker_domain, target_ip)
             try:
-                ws = await RawWebSocket.connect(
-                    worker_domain, worker_domain, timeout=10.0, path=path,
-                    secure=secure,
-                )
+                with client_setup(client_reader, client_writer):
+                    ws = await RawWebSocket.connect(
+                        worker_domain, worker_domain, timeout=10.0, path=path,
+                        secure=secure,
+                    )
                 break
             except Exception as exc:
                 cf_worker_pool.report_failure(worker_domain, exc)
@@ -217,7 +241,14 @@ async def _cfworker(
             return False
 
     stats.connections_cfproxy += 1
-    await ws.send(relay_init)
+    try:
+        await ws.send_init(relay_init)
+    except Exception as exc:
+        # The socket died between the upgrade and the relay start; the domain
+        # itself may be fine, so only this socket is discarded.
+        log.warning("[%s] DC%d%s CF worker %s send failed: %r",
+                    label, dc, media_tag, worker_domain, exc)
+        return False
     await bridge_ws(
         client_reader, client_writer, ws, label, ctx, stats, dc, is_media,
         splitter=splitter,
@@ -240,29 +271,28 @@ async def _cfproxy(
     media_tag = " media" if is_media else ""
     log.info("[%s] DC%d%s -> CF proxy pool", label, dc, media_tag)
 
-    ws = None
-    chosen = None
-    for base in balancer.get_domains_for_dc(dc):
-        domain = f"kws{dc}.{base}"
-        try:
-            ws = await RawWebSocket.connect(
-                domain, domain, timeout=10.0,
-                secure=not cfg.disable_secure,
-            )
-            chosen = base
-            break
-        except Exception as exc:
-            log.warning("[%s] DC%d%s CF %s failed: %r",
-                        label, dc, media_tag, base, exc)
-
-    if ws is None:
+    secure = not cfg.disable_secure
+    candidates = (
+        (base, f"kws{dc}.{base}") for base in balancer.get_domains_for_dc(dc)
+    )
+    with client_setup(client_reader, client_writer):
+        result = await connect_cf_domains(
+            candidates, label=label, secure=secure
+        )
+    if result is None:
         return False
+    ws, chosen = result
 
     if chosen and balancer.update_domain_for_dc(dc, chosen):
         log.info("[%s] active CF domain for DC%d -> %s", label, dc, chosen)
 
     stats.connections_cfproxy += 1
-    await ws.send(relay_init)
+    try:
+        await ws.send_init(relay_init)
+    except Exception as exc:
+        log.warning("[%s] DC%d%s CF proxy %s send failed: %r",
+                    label, dc, media_tag, chosen, exc)
+        return False
     await bridge_ws(
         client_reader, client_writer, ws, label, ctx, stats, dc, is_media,
         splitter=splitter,
@@ -293,11 +323,12 @@ async def _tcp(
         try:
             log.info("[%s] DC%d%s -> TCP fallback %s:443",
                      label, dc, media_tag, dst)
-            remote_reader, remote_writer = await asyncio.wait_for(
-                asyncio.open_connection(dst, 443), timeout=10
-            )
-            remote_writer.write(relay_init)
-            await remote_writer.drain()
+            with client_setup(client_reader, client_writer):
+                remote_reader, remote_writer = await asyncio.wait_for(
+                    asyncio.open_connection(dst, 443), timeout=10
+                )
+                remote_writer.write(relay_init)
+                await remote_writer.drain()
         except Exception as exc:
             delay = tcp_backoff.report_failure(key)
             log.warning(
@@ -319,6 +350,8 @@ async def _tcp(
         if remote_writer is not None:
             try:
                 remote_writer.close()
-                await remote_writer.wait_closed()
-            except (OSError, ConnectionError):
+                await wait_close(
+                    remote_writer.wait_closed(), RawWebSocket.CLOSE_TIMEOUT
+                )
+            except Exception:
                 pass

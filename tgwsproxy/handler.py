@@ -35,7 +35,7 @@ from .fake_tls import (
 )
 from .fallback import FallbackConfig, attempt_fallback
 from .stats import Stats
-from .websocket import apply_socket_options
+from .websocket import RawWebSocket, apply_socket_options, wait_close
 from .ws_pool import WebSocketPool, ws_domains_for
 from .constants import HANDSHAKE_LEN, TLS_RECORD_HANDSHAKE
 
@@ -128,7 +128,9 @@ class ClientHandler:
             self._stats.connections_active -= 1
             try:
                 client_writer.close()
-                await client_writer.wait_closed()
+                await wait_close(
+                    client_writer.wait_closed(), RawWebSocket.CLOSE_TIMEOUT
+                )
             except BaseException:
                 pass
 
@@ -306,7 +308,7 @@ class ClientHandler:
         self._stats.connections_ws += 1
 
         splitter = _safe_splitter(proto_int)
-        await ws.send(relay_init)
+        await ws.send_init(relay_init)
         await bridge_ws(
             reader, writer, ws, label, ctx, self._stats,
             dc=dc, is_media=is_media, splitter=splitter,

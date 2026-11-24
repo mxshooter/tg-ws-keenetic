@@ -48,7 +48,7 @@ from .constants import (
     X25519MLKEM768_CLIENT_SHARE_LEN,
     X25519_KEY_LEN,
 )
-from .websocket import set_x25519
+from .websocket import RawWebSocket, set_x25519, wait_close
 
 try:
     # Entware routers rarely ship cryptography: generating a real X25519 key
@@ -516,6 +516,13 @@ class FakeTlsStream:
     def is_closing(self):
         return self._writer.is_closing()
 
+    def at_eof(self) -> bool:
+        # Decoded records can still sit in the local buffers after the
+        # underlying reader has reached EOF.
+        if self._pending or self._record_left > 0:
+            return False
+        return self._reader.at_eof()
+
 
 async def relay_to_masking_domain(
     reader: asyncio.StreamReader,
@@ -547,20 +554,33 @@ async def relay_to_masking_domain(
                         break
                     dst.write(chunk)
                     await dst.drain()
-            except (ConnectionError, OSError, asyncio.CancelledError):
+            except (ConnectionError, OSError):
                 pass
             finally:
                 try:
                     dst.close()
-                    await dst.wait_closed()
+                    await wait_close(
+                        dst.wait_closed(), RawWebSocket.CLOSE_TIMEOUT
+                    )
                 except Exception:
                     pass
 
-        await asyncio.gather(
-            pipe(reader, upstream_writer), pipe(upstream_reader, writer)
-        )
-    finally:
+        tasks = [
+            asyncio.create_task(pipe(reader, upstream_writer)),
+            asyncio.create_task(pipe(upstream_reader, writer)),
+        ]
         try:
-            upstream_writer.close()
-        except Exception:
-            pass
+            # Whatever ends first, the other side must stop too: a dead front
+            # otherwise keeps the client socket in CLOSE_WAIT indefinitely.
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        for w in (upstream_writer, writer):
+            try:
+                w.close()
+                await wait_close(w.wait_closed(), RawWebSocket.CLOSE_TIMEOUT)
+            except Exception:
+                pass

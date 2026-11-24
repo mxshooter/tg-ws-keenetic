@@ -310,10 +310,12 @@ class CfWorkerPool:
     PER_DC_LIMIT = 1
     REFILL_BACKOFF_INITIAL = 1.0
     REFILL_BACKOFF_MAX = 3600.0
+    FAILURE_COOLDOWN = 60.0
 
     def __init__(self, stats: Stats = stats):
         self._stats = stats
         self._target = self.PER_DC_LIMIT
+        self._secure = True
         self._idle: Dict[int, Deque[Tuple[RawWebSocket, float, str]]] = {}
         self._refilling: Dict[int, asyncio.Task] = {}
         self._rotating: Dict[int, asyncio.Task] = {}
@@ -321,9 +323,10 @@ class CfWorkerPool:
         self._refill_after: Dict[int, float] = {}
         self._exhausted_until: Dict[str, float] = {}
 
-    def set_target(self, size: int) -> None:
+    def set_target(self, size: int, *, secure: bool = True) -> None:
         """Keep at most PER_DC_LIMIT sockets per DC; 0 disables the pool."""
         self._target = max(0, min(size, self.PER_DC_LIMIT))
+        self._secure = secure
 
     async def acquire(
         self, dc: int, fallback_dst: str, worker_domains: List[str]
@@ -501,7 +504,8 @@ class CfWorkerPool:
         for worker_domain in self.available_domains(worker_domains):
             try:
                 ws = await RawWebSocket.connect(
-                    worker_domain, worker_domain, timeout=8, path=path
+                    worker_domain, worker_domain, timeout=8, path=path,
+                    secure=self._secure,
                 )
                 return ws, worker_domain
             except Exception as exc:
@@ -513,7 +517,7 @@ class CfWorkerPool:
         return None
 
     def available_domains(self, worker_domains: List[str]) -> List[str]:
-        now = time.time()
+        now = time.monotonic()
         domains: List[str] = []
         for domain in worker_domains:
             if domain in domains:
@@ -528,16 +532,34 @@ class CfWorkerPool:
         return domains
 
     def report_failure(self, worker_domain: str, exc: Exception) -> None:
-        if not isinstance(exc, WsHandshakeError) or exc.status_code != 429:
-            return
-        now = time.time()
+        now = time.monotonic()
         if self._exhausted_until.get(worker_domain, 0) > now:
             return
-        exhausted_until = now + (86400 - (now % 86400))
+
+        if isinstance(exc, WsHandshakeError):
+            if exc.status_code == 429:
+                # Workers free plan reports the daily request limit as 429.
+                exhausted_until = now + (86400 - (time.time() % 86400))
+                reason = "daily request limit"
+            elif exc.status_code >= 500:
+                exhausted_until = now + self.FAILURE_COOLDOWN
+                reason = f"HTTP {exc.status_code}"
+            else:
+                # A challenge or a misconfigured route is not a reason to
+                # disable the whole domain.
+                return
+        elif isinstance(exc, (OSError, asyncio.TimeoutError)):
+            exhausted_until = now + self.FAILURE_COOLDOWN
+            reason = repr(exc)
+        else:
+            return
+
         self._exhausted_until[worker_domain] = exhausted_until
         log.warning(
-            "CF worker %s reached its request limit, disabled for %d seconds",
-            worker_domain, int(exhausted_until - now),
+            "CF worker %s disabled for %d seconds: %s",
+            worker_domain,
+            max(1, int(exhausted_until - now)),
+            reason,
         )
 
     @staticmethod

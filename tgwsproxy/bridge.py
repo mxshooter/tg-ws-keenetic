@@ -23,7 +23,7 @@ from .constants import (
 from .crypto import ReencryptionContext
 from .network_debug import WsActivity
 from .stats import Stats, human_bytes
-from .websocket import RawWebSocket
+from .websocket import RawWebSocket, wait_close
 
 log = logging.getLogger("tgwsproxy.bridge")
 _UNPACK_LE_U32 = struct.Struct("<I")
@@ -266,7 +266,9 @@ async def bridge_ws(
             pass
         try:
             client_writer.close()
-            await client_writer.wait_closed()
+            await wait_close(
+                client_writer.wait_closed(), RawWebSocket.CLOSE_TIMEOUT
+            )
         except BaseException:
             pass
 
@@ -322,6 +324,8 @@ async def bridge_tcp(
         for w in (client_writer, remote_writer):
             try:
                 w.close()
-                await w.wait_closed()
+                await wait_close(
+                    w.wait_closed(), RawWebSocket.CLOSE_TIMEOUT
+                )
             except BaseException:
                 pass

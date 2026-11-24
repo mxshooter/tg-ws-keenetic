@@ -13,6 +13,7 @@ from typing import Optional, Set
 
 from .balancer import balancer
 from ._aes import AES_BACKEND
+from .client_guard import ClientStreamProtocol
 from .config import (
     Config,
     start_cfproxy_domain_refresh,
@@ -28,6 +29,7 @@ from .fake_tls import (
 )
 from .handler import ClientHandler, HandlerSettings
 from .stats import stats
+from .websocket import reset_cf_timeouts
 from .ws_pool import WebSocketPool, cf_worker_pool
 
 log = logging.getLogger("tgwsproxy.server")
@@ -89,6 +91,7 @@ class ProxyServer:
             balancer.update_domains_list(self._config.cfproxy_user_domains)
 
         tcp_backoff.reset()
+        reset_cf_timeouts()
         self._stopping = False
 
         self._pool = WebSocketPool(
@@ -97,7 +100,10 @@ class ProxyServer:
             stats=stats,
         )
         # pool_size == 0 disables pooling everywhere, the CF worker included.
-        cf_worker_pool.set_target(self._config.pool_size)
+        cf_worker_pool.set_target(
+            self._config.pool_size,
+            secure=not self._config.disable_secure,
+        )
         self._h2_pool = _make_h2_pool(self._config)
         self._handler = ClientHandler(
             settings=self._build_handler_settings(),
@@ -111,8 +117,11 @@ class ProxyServer:
         # this proxy fails fast instead of answering itself.
         await self._apply_fake_tls_profile()
 
-        self._server = await asyncio.start_server(
-            self._on_client, self._config.host, self._config.port
+        loop = asyncio.get_running_loop()
+        self._server = await loop.create_server(
+            lambda: ClientStreamProtocol(self._on_client),
+            self._config.host,
+            self._config.port,
         )
         self._set_nodelay()
 
