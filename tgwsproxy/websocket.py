@@ -10,11 +10,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import math
 import os
 import socket as _socket
 import ssl
 import struct
-from typing import List, Optional, Tuple
+from typing import Awaitable, Dict, Iterable, List, Optional, Tuple
 
 from .constants import (
     WS_FIN_BIT,
@@ -28,6 +29,12 @@ from .constants import (
 )
 
 log = logging.getLogger("tgwsproxy.websocket")
+
+# CF front domains that timed out are skipped for a while: when the whole
+# pool is blocked, every client would otherwise walk the same dead hosts.
+CF_TIMEOUT_COOLDOWN = 30.0
+CF_CONNECT_TIMEOUTS = (10.0, 6.0, 4.0, 3.0, 3.0)
+_cf_timeout_until: Dict[Tuple[str, bool], float] = {}
 
 _HEAD_BB = struct.Struct(">BB")
 _HEAD_BBH = struct.Struct(">BBH")
@@ -135,10 +142,58 @@ def _xor_mask(data: bytes, mask: bytes) -> bytes:
 MAX_MESSAGE_LEN = 16 * 1024 * 1024
 
 
+async def wait_close(awaitable: Awaitable, timeout: float) -> None:
+    """Wait for `awaitable`, but never longer than `timeout`.
+
+    `asyncio.wait_for()` may lose an external cancellation when the inner
+    task finishes at the same moment (Python < 3.12), so `wait()` is used
+    and the cancellation stays with the caller.
+    """
+    task = asyncio.ensure_future(awaitable)
+    try:
+        done, _ = await asyncio.wait((task,), timeout=timeout)
+        if not done:
+            raise asyncio.TimeoutError()
+        task.result()
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+def _log_setup_failure(
+    host: str,
+    port: int,
+    secure: bool,
+    writer: Optional[asyncio.StreamWriter],
+    exc: BaseException,
+) -> None:
+    """Debug breadcrumb for a failed WS open: DNS, TCP/TLS or upgrade."""
+    if not isinstance(exc, Exception) or not log.isEnabledFor(logging.DEBUG):
+        return
+    if writer is not None:
+        stage = "ws_upgrade"
+        local = writer.get_extra_info("sockname")
+        remote = writer.get_extra_info("peername")
+    else:
+        stage = "tcp/tls" if secure else "tcp"
+        if isinstance(exc, _socket.gaierror):
+            stage = "dns"
+        local = remote = None
+    log.debug(
+        "WS setup failed: host=%s port=%d stage=%s local=%s remote=%s "
+        "error=%r",
+        host, port, stage, local, remote, exc,
+    )
+
+
 class RawWebSocket:
     """Bare-bones client. One stream in, one stream out, no threads."""
 
     __slots__ = ("reader", "writer", "_closed", "_frag")
+
+    # A silent TLS peer can hold close() for ssl_shutdown_timeout (~30s).
+    CLOSE_TIMEOUT = 2.0
 
     def __init__(
         self,
@@ -181,47 +236,54 @@ class RawWebSocket:
         ssl_context = _SSL_CTX_FRONTING if sni else _SSL_CTX
         if sni is None:
             sni = sni_domain
-        reader, writer = await asyncio.wait_for(
-            (
-                asyncio.open_connection(
-                    host, 443, ssl=ssl_context, server_hostname=sni
-                )
-                if secure
-                else asyncio.open_connection(host, 80)
-            ),
-            timeout=min(timeout, 10),
+        port = 443 if secure else 80
+        tls_options = (
+            {"ssl": ssl_context, "server_hostname": sni} if secure else {}
         )
-        apply_socket_options(writer.transport, buffer_size)
-
-        ws_key = base64.b64encode(os.urandom(16)).decode()
-        request = (
-            f"GET {path} HTTP/1.1\r\n"
-            f"Host: {sni_domain}\r\n"
-            f"Upgrade: websocket\r\n"
-            f"Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {ws_key}\r\n"
-            f"Sec-WebSocket-Version: 13\r\n"
-            f"Sec-WebSocket-Protocol: binary\r\n"
-            f"\r\n"
-        )
+        loop = asyncio.get_running_loop()
+        # One deadline covers TCP/TLS, the request and every header line.
+        # Per-line timeouts let a slow host burn `timeout` on each line.
+        deadline = loop.time() + timeout
+        writer: Optional[asyncio.StreamWriter] = None
         try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port, **tls_options),
+                timeout=min(timeout, 10),
+            )
+            apply_socket_options(writer.transport, buffer_size)
+
+            ws_key = base64.b64encode(os.urandom(16)).decode()
+            request = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {sni_domain}\r\n"
+                f"Upgrade: websocket\r\n"
+                f"Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {ws_key}\r\n"
+                f"Sec-WebSocket-Version: 13\r\n"
+                f"Sec-WebSocket-Protocol: binary\r\n"
+                f"\r\n"
+            )
             writer.write(request.encode())
-            await writer.drain()
+            await asyncio.wait_for(writer.drain(), deadline - loop.time())
 
             status_code, status_line, headers = await cls._read_response(
-                reader, timeout
+                reader, deadline
             )
             if status_code == 101:
                 return cls(reader, writer)
-        except BaseException:
-            try:
-                writer.close()
-            except Exception:
-                pass
+        except BaseException as exc:
+            if writer is not None:
+                # abort() releases a half-open handshake socket at once;
+                # close() may leave it lingering after a peer reset.
+                try:
+                    writer.transport.abort()
+                except Exception:
+                    pass
+                _log_setup_failure(host, port, secure, writer, exc)
             raise
 
         try:
-            writer.close()
+            writer.transport.abort()
         except Exception:
             pass
         raise WsHandshakeError(
@@ -233,11 +295,14 @@ class RawWebSocket:
 
     @staticmethod
     async def _read_response(
-        reader: asyncio.StreamReader, timeout: float
+        reader: asyncio.StreamReader, deadline: float
     ) -> Tuple[int, str, dict]:
         lines: List[str] = []
+        loop = asyncio.get_running_loop()
         while True:
-            line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+            line = await asyncio.wait_for(
+                reader.readline(), deadline - loop.time()
+            )
             if line in (b"\r\n", b"\n", b""):
                 break
             lines.append(line.decode("utf-8", errors="replace").strip())
@@ -257,6 +322,22 @@ class RawWebSocket:
                 k, v = hl.split(":", 1)
                 headers[k.strip().lower()] = v.strip()
         return status_code, first, headers
+
+    async def send_init(self, data: bytes) -> None:
+        """Send the relay handshake; abort the socket when it cannot be sent.
+
+        A front may reset the connection right after the upgrade, and the
+        relay has not started yet, so nobody else would close this socket.
+        """
+        try:
+            await asyncio.wait_for(self.send(data), timeout=10)
+        except BaseException:
+            self._closed = True
+            try:
+                self.writer.transport.abort()
+            except Exception:
+                pass
+            raise
 
     async def send(self, data: bytes) -> None:
         if self._closed:
@@ -329,13 +410,22 @@ class RawWebSocket:
                 self._closed = True
                 try:
                     self.writer.write(self._frame(WS_OP_CLOSE, b""))
-                    await self.writer.drain()
+                    await wait_close(self.writer.drain(), self.CLOSE_TIMEOUT)
                 except Exception:
                     pass
         finally:
             try:
                 self.writer.close()
-                await self.writer.wait_closed()
+                await wait_close(
+                    self.writer.wait_closed(), self.CLOSE_TIMEOUT
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+                try:
+                    self.writer.transport.abort()
+                except Exception:
+                    pass
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
             except Exception:
                 pass
 
@@ -394,3 +484,74 @@ class RawWebSocket:
 
         payload = await self.reader.readexactly(length)
         return opcode, payload, fin
+
+
+def reset_cf_timeouts() -> None:
+    """Forget CF host cooldowns (proxy restart or config change)."""
+    _cf_timeout_until.clear()
+
+
+async def connect_cf_domains(
+    candidates: Iterable[Tuple[str, str]],
+    *,
+    label: str,
+    secure: bool,
+    path: str = "/apiws",
+    timeout: float = 10.0,
+) -> Optional[Tuple[RawWebSocket, str]]:
+    """Dial CF front domains, skipping hosts that timed out recently.
+
+    Each timeout shortens the next attempt, and five timeouts end the search,
+    so a single client cannot spend minutes walking a dead pool. The host that
+    timed out is skipped by later clients for ``CF_TIMEOUT_COOLDOWN``.
+    """
+    loop = asyncio.get_running_loop()
+    timeouts = 0
+
+    for name, host in candidates:
+        key = (host, secure)
+        now = loop.time()
+
+        retry_at = _cf_timeout_until.get(key)
+        if retry_at is not None:
+            if now < retry_at:
+                continue
+            # Mark the retry as in progress; finally restores it if needed.
+            _cf_timeout_until[key] = math.inf
+
+        ws: Optional[RawWebSocket] = None
+        try:
+            attempt_timeout = min(timeout, CF_CONNECT_TIMEOUTS[timeouts])
+            ws = await RawWebSocket.connect(
+                host, host, path=path, secure=secure, timeout=attempt_timeout
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            now = loop.time()
+            if retry_at is not None or key not in _cf_timeout_until:
+                for old_key, until in list(_cf_timeout_until.items()):
+                    if until + CF_TIMEOUT_COOLDOWN <= now:
+                        del _cf_timeout_until[old_key]
+                _cf_timeout_until[key] = now + CF_TIMEOUT_COOLDOWN
+                log.warning(
+                    "[%s] CF WebSocket timed out (host=%s port=%d); "
+                    "retry in %.0fs",
+                    label, host, 443 if secure else 80, CF_TIMEOUT_COOLDOWN,
+                )
+            timeouts += 1
+            if timeouts >= len(CF_CONNECT_TIMEOUTS):
+                break
+            continue
+        except Exception as exc:
+            log.warning(
+                "[%s] CF WebSocket failed (host=%s port=%d): %r",
+                label, host, 443 if secure else 80, exc,
+            )
+        finally:
+            if retry_at is not None and _cf_timeout_until.get(key) == math.inf:
+                _cf_timeout_until[key] = retry_at
+
+        _cf_timeout_until.pop(key, None)
+        if ws is not None:
+            return ws, name
+
+    return None

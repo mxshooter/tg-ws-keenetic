@@ -10,10 +10,12 @@ import asyncio
 import time
 import unittest
 from collections import deque
+from unittest import mock
 from unittest.mock import AsyncMock, Mock
 
 from tgwsproxy import handler as handler_module
 from tgwsproxy.stats import Stats
+from tgwsproxy.websocket import WsHandshakeError
 from tgwsproxy.ws_pool import CfWorkerPool
 
 
@@ -111,6 +113,96 @@ class CfWorkerPoolTest(unittest.IsolatedAsyncioTestCase):
 
         pool.reset()
         await asyncio.sleep(0)
+
+
+class CfWorkerSecureFlagTest(unittest.IsolatedAsyncioTestCase):
+    async def test_pool_uses_secure_flag_from_config(self):
+        pool = CfWorkerPool(stats=Stats())
+        pool.set_target(1, secure=False)
+        connect = AsyncMock(return_value=_FakeWS())
+        with mock.patch("tgwsproxy.ws_pool.RawWebSocket.connect", connect):
+            await pool._connect_one(["w.example"], "1.2.3.4", 2)
+
+        self.assertFalse(connect.await_args.kwargs["secure"])
+
+
+class CfWorkerFailureReportTest(unittest.TestCase):
+    NOW = 1_700_000_000.0
+
+    def _report(self, exc, now=None):
+        pool = CfWorkerPool(stats=Stats())
+        now = self.NOW if now is None else now
+        with mock.patch(
+            "tgwsproxy.ws_pool.time.monotonic", return_value=now
+        ), mock.patch("tgwsproxy.ws_pool.time.time", return_value=now):
+            pool.report_failure("w.example", exc)
+        return pool
+
+    def _available(self, pool, now):
+        with mock.patch("tgwsproxy.ws_pool.time.monotonic", return_value=now):
+            return pool.available_domains(["w.example"])
+
+    def test_429_disables_domain_until_the_next_day(self):
+        pool = self._report(WsHandshakeError(429, "429 Too Many Requests"))
+        until = pool._exhausted_until["w.example"]
+        self.assertGreater(until, self.NOW)
+        self.assertLessEqual(until, self.NOW + 86400)
+        self.assertEqual(self._available(pool, self.NOW), [])
+        self.assertEqual(self._available(pool, until + 1), ["w.example"])
+
+    def test_5xx_pauses_domain_for_a_minute(self):
+        pool = self._report(WsHandshakeError(503, "503 Service Unavailable"))
+        self.assertEqual(
+            pool._exhausted_until["w.example"],
+            self.NOW + CfWorkerPool.FAILURE_COOLDOWN,
+        )
+        self.assertEqual(self._available(pool, self.NOW), [])
+        self.assertEqual(
+            self._available(
+                pool, self.NOW + CfWorkerPool.FAILURE_COOLDOWN + 1
+            ),
+            ["w.example"],
+        )
+
+    def test_network_errors_pause_domain(self):
+        for exc in (OSError("connection reset"), asyncio.TimeoutError()):
+            with self.subTest(exc=exc):
+                pool = self._report(exc)
+                self.assertEqual(self._available(pool, self.NOW), [])
+                self.assertEqual(
+                    self._available(
+                        pool, self.NOW + CfWorkerPool.FAILURE_COOLDOWN + 1
+                    ),
+                    ["w.example"],
+                )
+
+    def test_client_4xx_keeps_domain_available(self):
+        for status in (400, 403, 404):
+            with self.subTest(status=status):
+                pool = self._report(
+                    WsHandshakeError(status, f"{status} error")
+                )
+                self.assertNotIn("w.example", pool._exhausted_until)
+                self.assertEqual(
+                    self._available(pool, self.NOW), ["w.example"]
+                )
+
+    def test_unknown_errors_are_ignored(self):
+        pool = self._report(ValueError("unexpected"))
+        self.assertNotIn("w.example", pool._exhausted_until)
+
+    def test_longer_quota_pause_is_not_shortened(self):
+        pool = self._report(WsHandshakeError(429, "429 Too Many Requests"))
+        until = pool._exhausted_until["w.example"]
+        with mock.patch(
+            "tgwsproxy.ws_pool.time.monotonic", return_value=self.NOW + 1
+        ), mock.patch(
+            "tgwsproxy.ws_pool.time.time", return_value=self.NOW + 1
+        ):
+            pool.report_failure(
+                "w.example", WsHandshakeError(503, "503 error")
+            )
+        self.assertEqual(pool._exhausted_until["w.example"], until)
 
 
 if __name__ == "__main__":
