@@ -1,4 +1,4 @@
-"""Tests for WebSocket socket lifecycle and CF front timeouts.
+"""Tests for the WebSocket socket lifecycle.
 
 Run with::
 
@@ -95,100 +95,6 @@ class HandshakeCleanupTest(unittest.IsolatedAsyncioTestCase):
             self.assertLess(time.monotonic() - started, 1.0)
         writer.transport.abort.assert_called_once()
 
-
-class CfDomainTimeoutTest(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        ws_module.reset_cf_timeouts()
-        self.addCleanup(ws_module.reset_cf_timeouts)
-
-    async def connect(self, *hosts):
-        return await ws_module.connect_cf_domains(
-            ((host, host) for host in hosts), secure=True, label="test"
-        )
-
-    async def test_five_timeouts_end_search_and_later_clients_skip(self):
-        hosts = ("a", "http-error", "b", "c", "d", "e", "f")
-        responses = [
-            asyncio.TimeoutError(),
-            WsHandshakeError(503, "unavailable"),
-            TimeoutError(),
-            TimeoutError(),
-            TimeoutError(),
-            TimeoutError(),
-            WsHandshakeError(429, "busy"),
-            object(),
-        ]
-        with patch.object(
-            RawWebSocket, "connect", side_effect=responses
-        ) as dial:
-            self.assertIsNone(await self.connect(*hosts))
-            self.assertEqual((await self.connect(*hosts))[1], "f")
-            self.assertEqual(
-                [
-                    (call.args[0], call.kwargs["timeout"])
-                    for call in dial.await_args_list
-                ],
-                [
-                    ("a", 10),
-                    ("http-error", 6),
-                    ("b", 6),
-                    ("c", 4),
-                    ("d", 3),
-                    ("e", 3),
-                    ("http-error", 10),
-                    ("f", 10),
-                ],
-            )
-
-    async def test_timeout_retry_skips_to_other_front_without_waiting(self):
-        with patch.object(ws_module, "CF_TIMEOUT_COOLDOWN", 0), patch.object(
-            RawWebSocket, "connect", side_effect=asyncio.TimeoutError()
-        ):
-            self.assertIsNone(await self.connect("a"))
-
-        started, release = asyncio.Event(), asyncio.Event()
-
-        async def dial(host, *args, **kwargs):
-            if host == "a":
-                started.set()
-                await release.wait()
-                raise WsHandshakeError(429, "busy")
-            return object()
-
-        with patch.object(RawWebSocket, "connect", side_effect=dial) as dial_mock:
-            retry = asyncio.create_task(self.connect("a"))
-            try:
-                await asyncio.wait_for(started.wait(), 1)
-                result = await asyncio.wait_for(self.connect("a", "b"), 1)
-                self.assertEqual(result[1], "b")
-                self.assertEqual(dial_mock.await_count, 2)
-            finally:
-                release.set()
-                await retry
-
-        with patch.object(RawWebSocket, "connect", return_value=object()):
-            self.assertEqual((await self.connect("a"))[1], "a")
-
-    async def test_cancelling_timeout_retry_releases_it_for_next_client(self):
-        with patch.object(ws_module, "CF_TIMEOUT_COOLDOWN", 0), patch.object(
-            RawWebSocket, "connect", side_effect=asyncio.TimeoutError()
-        ):
-            await self.connect("a")
-        started = asyncio.Event()
-
-        async def dial(*args, **kwargs):
-            started.set()
-            await asyncio.Future()
-
-        with patch.object(RawWebSocket, "connect", side_effect=dial):
-            retry = asyncio.create_task(self.connect("a"))
-            await asyncio.wait_for(started.wait(), 1)
-            retry.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await retry
-
-        with patch.object(RawWebSocket, "connect", return_value=object()):
-            self.assertEqual((await self.connect("a"))[1], "a")
 
 
 if __name__ == "__main__":

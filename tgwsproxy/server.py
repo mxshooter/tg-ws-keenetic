@@ -13,6 +13,7 @@ from typing import Optional, Set
 
 from .balancer import balancer
 from ._aes import AES_BACKEND
+from .cf_websocket import reset_cf_timeouts
 from .client_guard import ClientStreamProtocol
 from .config import (
     Config,
@@ -29,7 +30,6 @@ from .fake_tls import (
 )
 from .handler import ClientHandler, HandlerSettings
 from .stats import stats
-from .websocket import reset_cf_timeouts
 from .ws_pool import WebSocketPool, cf_worker_pool
 
 log = logging.getLogger("tgwsproxy.server")

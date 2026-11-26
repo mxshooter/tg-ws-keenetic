@@ -14,15 +14,15 @@ import asyncio
 import logging
 import time
 from typing import Dict, Iterable, Optional, Set, Tuple
-from urllib.parse import urlencode
 
 from .balancer import balancer
 from .bridge import MessageSplitter, bridge_tcp, bridge_ws
+from .cf_websocket import cf_prefers_tls, connect_cf_domains
 from .client_guard import client_setup
 from .constants import DC_DEFAULT_IPS, DC_TEST_IPS
 from .crypto import ReencryptionContext
 from .stats import Stats
-from .websocket import RawWebSocket, connect_cf_domains, wait_close
+from .websocket import RawWebSocket, wait_close
 from .ws_pool import cf_worker_pool
 
 log = logging.getLogger("tgwsproxy.fallback")
@@ -141,7 +141,7 @@ async def attempt_fallback(
     if cfg.cfproxy_enabled and not is_test_dc:
         # Media traffic can be multiplexed over HTTP/2 to the CF proxy, which
         # is far cheaper than one WS connection per stream.
-        if is_media and h2_pool is not None and proto_tag is not None:
+        if is_media and h2_pool is not None and proto_tag is not None and cf_prefers_tls():
             try:
                 with client_setup(client_reader, client_writer):
                     channel = await h2_pool.open(dc, label)
@@ -211,7 +211,6 @@ async def _cfworker(
 ) -> bool:
     media_tag = " media" if is_media else ""
     worker_domains = list(cfg.cfproxy_worker_domains)
-    secure = not cfg.disable_secure
 
     pooled = await cf_worker_pool.acquire(dc, target_ip, worker_domains)
     if pooled is not None:
@@ -219,26 +218,15 @@ async def _cfworker(
         log.info("[%s] DC%d%s -> CF worker pool hit via %s for %s",
                  label, dc, media_tag, worker_domain, target_ip)
     else:
-        query = urlencode({"dst": target_ip, "dc": str(dc)})
-        path = f"/apiws?{query}"
-        ws = None
-        for worker_domain in cf_worker_pool.available_domains(worker_domains):
-            log.info("[%s] DC%d%s -> CF worker %s for %s",
-                     label, dc, media_tag, worker_domain, target_ip)
-            try:
-                with client_setup(client_reader, client_writer):
-                    ws = await RawWebSocket.connect(
-                        worker_domain, worker_domain, timeout=10.0, path=path,
-                        secure=secure,
-                    )
-                break
-            except Exception as exc:
-                cf_worker_pool.report_failure(worker_domain, exc)
-                log.warning("[%s] DC%d%s CF worker %s failed: %r",
-                            label, dc, media_tag, worker_domain, exc)
-                continue
-        if ws is None:
+        with client_setup(client_reader, client_writer):
+            connected = await cf_worker_pool.connect_one(
+                worker_domains, target_ip, dc, timeout=10.0
+            )
+        if connected is None:
             return False
+        ws, worker_domain = connected
+        log.info("[%s] DC%d%s -> CF worker %s for %s",
+                 label, dc, media_tag, worker_domain, target_ip)
 
     stats.connections_cfproxy += 1
     try:
