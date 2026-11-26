@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import httpx
 
 from .balancer import balancer
+from .cf_websocket import cf_tls_in_cooldown
 from .constants import (
     DC_DEFAULT_IPS,
     PROTO_TAG_ABRIDGED,
@@ -888,6 +889,8 @@ class CfH2Pool:
             log.warning('[%s] H2 unsupported DC%d -> existing WS route', label, dc)
             return None
         for base_domain in balancer.get_domains_for_dc(dc):
+            if cf_tls_in_cooldown(base_domain):
+                continue
             host = 'kws%d.%s' % (dc, base_domain)
             async with self.locks.setdefault(host, asyncio.Lock()):
                 if self.closed:

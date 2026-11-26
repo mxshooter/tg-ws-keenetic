@@ -17,6 +17,7 @@ import random
 import time
 from collections import deque
 from typing import Deque, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlencode
 
 from .constants import WS_PATH, WS_PATH_TEST
 from .stats import Stats, stats
@@ -316,6 +317,7 @@ class CfWorkerPool:
         self._stats = stats
         self._target = self.PER_DC_LIMIT
         self._secure = True
+        self.try_secure_first = True
         self._idle: Dict[int, Deque[Tuple[RawWebSocket, float, str]]] = {}
         self._refilling: Dict[int, asyncio.Task] = {}
         self._rotating: Dict[int, asyncio.Task] = {}
@@ -327,6 +329,7 @@ class CfWorkerPool:
         """Keep at most PER_DC_LIMIT sockets per DC; 0 disables the pool."""
         self._target = max(0, min(size, self.PER_DC_LIMIT))
         self._secure = secure
+        self.try_secure_first = True
 
     async def acquire(
         self, dc: int, fallback_dst: str, worker_domains: List[str]
@@ -375,11 +378,25 @@ class CfWorkerPool:
         self._refill_failures.clear()
         self._refill_after.clear()
         self._exhausted_until.clear()
+        self.try_secure_first = True
 
     async def close(self) -> None:
         tasks = list(self._rotating.values()) + list(self._refilling.values())
         self.reset()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _defer_if_all_workers_paused(
+        self, dc: int, worker_domains: List[str], now: float
+    ) -> bool:
+        """Wait for the first paused domain instead of growing the backoff."""
+        first_available = min(
+            self._exhausted_until.get(domain, now)
+            for domain in worker_domains
+        )
+        if first_available <= now:
+            return False
+        self._refill_after[dc] = first_available
+        return True
 
     def _schedule_refill(
         self, dc: int, fallback_dst: str, worker_domains: List[str]
@@ -387,9 +404,11 @@ class CfWorkerPool:
         if self._target <= 0 or not worker_domains:
             return
         self._schedule_rotation(dc, fallback_dst, worker_domains)
+        now = time.monotonic()
         if (
             dc in self._refilling
-            or time.monotonic() < self._refill_after.get(dc, 0)
+            or self._defer_if_all_workers_paused(dc, worker_domains, now)
+            or now < self._refill_after.get(dc, 0)
         ):
             return
         self._refilling[dc] = asyncio.create_task(
@@ -406,7 +425,7 @@ class CfWorkerPool:
                 return
             connected = 0
             for _ in range(needed):
-                result = await self._connect_one(
+                result = await self.connect_one(
                     worker_domains, fallback_dst, dc
                 )
                 if self._refilling.get(dc) is not asyncio.current_task():
@@ -422,6 +441,9 @@ class CfWorkerPool:
                 self._refill_failures.pop(dc, None)
                 self._refill_after.pop(dc, None)
             else:
+                now = time.monotonic()
+                if self._defer_if_all_workers_paused(dc, worker_domains, now):
+                    return
                 failures = self._refill_failures.get(dc, 0) + 1
                 self._refill_failures[dc] = failures
                 delay = min(
@@ -429,7 +451,7 @@ class CfWorkerPool:
                     * (2 ** min(failures - 1, 12)),
                     self.REFILL_BACKOFF_MAX,
                 )
-                self._refill_after[dc] = time.monotonic() + delay
+                self._refill_after[dc] = now + delay
                 log.info(
                     "CF worker pool refill failed for DC%d, retry in %.0fs",
                     dc, delay,
@@ -495,25 +517,49 @@ class CfWorkerPool:
             if self._rotating.get(dc) is asyncio.current_task():
                 self._rotating.pop(dc, None)
 
-    async def _connect_one(
-        self, worker_domains: List[str], fallback_dst: str, dc: int
+    async def connect_one(
+        self,
+        worker_domains: List[str],
+        fallback_dst: str,
+        dc: int,
+        *,
+        timeout: float = 8.0,
     ) -> Optional[Tuple[RawWebSocket, str]]:
-        from urllib.parse import urlencode
+        """Dial one worker domain, retrying the other mode after a timeout.
 
+        A TLS attempt that times out is followed by plain HTTP for the same
+        domain, and the mode that worked last is tried first next time.
+        """
         path = f"/apiws?{urlencode({'dst': fallback_dst, 'dc': str(dc)})}"
+        modes = (
+            (False,)
+            if not self._secure
+            else (self.try_secure_first, not self.try_secure_first)
+        )
         for worker_domain in self.available_domains(worker_domains):
-            try:
-                ws = await RawWebSocket.connect(
-                    worker_domain, worker_domain, timeout=8, path=path,
-                    secure=self._secure,
-                )
+            for attempt, secure in enumerate(modes, 1):
+                try:
+                    ws = await RawWebSocket.connect(
+                        worker_domain, worker_domain, timeout=timeout,
+                        path=path, secure=secure,
+                    )
+                except Exception as exc:
+                    log.debug(
+                        "CF worker pool connect DC%d via %s for %s failed "
+                        "(tls=%s): %r",
+                        dc, worker_domain, fallback_dst, secure, exc,
+                    )
+                    if (
+                        attempt < len(modes)
+                        and isinstance(
+                            exc, (asyncio.TimeoutError, TimeoutError)
+                        )
+                    ):
+                        continue
+                    self.report_failure(worker_domain, exc)
+                    break
+                self.try_secure_first = secure
                 return ws, worker_domain
-            except Exception as exc:
-                log.debug(
-                    "CF worker pool connect DC%d via %s for %s failed: %r",
-                    dc, worker_domain, fallback_dst, exc,
-                )
-                self.report_failure(worker_domain, exc)
         return None
 
     def available_domains(self, worker_domains: List[str]) -> List[str]:

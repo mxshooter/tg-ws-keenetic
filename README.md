@@ -151,7 +151,7 @@ ssh -L 1434:127.0.0.1:1434 root@<router>
 | `cfproxy_user_domains` | list[str] | Свои CF-домены (перебивают встроенный пул); можно несколько, пробуются по очереди |
 | `cfproxy_worker_domains` | list[str] | Свои CF Worker домены (пробуются первыми, пул привязывается к рабочему) |
 | `cfproxy_h2_media` | bool | Мультиплексировать медиа-трафик по HTTP/2 к CF (нужны `httpx`+`h2`) |
-| `disable_secure` | bool | CF-подключения по HTTP (порт 80) вместо TLS |
+| `disable_secure` | bool | Принудительно перевести CF-подключения на HTTP (порт 80); по умолчанию TLS, а после таймаута прокси сам пробует HTTP |
 | `fake_tls_domain` | str | SNI для Fake-TLS маскировки; пусто = выкл. На старте размер «заглушки» подстраивается под реальный сайт. Повторно присланный ClientHello (запись + воспроизведение) не получает ServerHello — уходит в маскировочный домен. |
 | `proxy_protocol` | bool | Принимать PROXY protocol v1 (если за nginx/haproxy) |
 | `force_test_dc` | bool | Форсировать ВСЕ соединения на Telegram TEST датацентры |

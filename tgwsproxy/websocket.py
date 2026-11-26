@@ -10,12 +10,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
-import math
 import os
 import socket as _socket
 import ssl
 import struct
-from typing import Awaitable, Dict, Iterable, List, Optional, Tuple
+from typing import Awaitable, List, Optional, Tuple
 
 from .constants import (
     WS_FIN_BIT,
@@ -29,12 +28,6 @@ from .constants import (
 )
 
 log = logging.getLogger("tgwsproxy.websocket")
-
-# CF front domains that timed out are skipped for a while: when the whole
-# pool is blocked, every client would otherwise walk the same dead hosts.
-CF_TIMEOUT_COOLDOWN = 30.0
-CF_CONNECT_TIMEOUTS = (10.0, 6.0, 4.0, 3.0, 3.0)
-_cf_timeout_until: Dict[Tuple[str, bool], float] = {}
 
 _HEAD_BB = struct.Struct(">BB")
 _HEAD_BBH = struct.Struct(">BBH")
@@ -485,73 +478,3 @@ class RawWebSocket:
         payload = await self.reader.readexactly(length)
         return opcode, payload, fin
 
-
-def reset_cf_timeouts() -> None:
-    """Forget CF host cooldowns (proxy restart or config change)."""
-    _cf_timeout_until.clear()
-
-
-async def connect_cf_domains(
-    candidates: Iterable[Tuple[str, str]],
-    *,
-    label: str,
-    secure: bool,
-    path: str = "/apiws",
-    timeout: float = 10.0,
-) -> Optional[Tuple[RawWebSocket, str]]:
-    """Dial CF front domains, skipping hosts that timed out recently.
-
-    Each timeout shortens the next attempt, and five timeouts end the search,
-    so a single client cannot spend minutes walking a dead pool. The host that
-    timed out is skipped by later clients for ``CF_TIMEOUT_COOLDOWN``.
-    """
-    loop = asyncio.get_running_loop()
-    timeouts = 0
-
-    for name, host in candidates:
-        key = (host, secure)
-        now = loop.time()
-
-        retry_at = _cf_timeout_until.get(key)
-        if retry_at is not None:
-            if now < retry_at:
-                continue
-            # Mark the retry as in progress; finally restores it if needed.
-            _cf_timeout_until[key] = math.inf
-
-        ws: Optional[RawWebSocket] = None
-        try:
-            attempt_timeout = min(timeout, CF_CONNECT_TIMEOUTS[timeouts])
-            ws = await RawWebSocket.connect(
-                host, host, path=path, secure=secure, timeout=attempt_timeout
-            )
-        except (asyncio.TimeoutError, TimeoutError):
-            now = loop.time()
-            if retry_at is not None or key not in _cf_timeout_until:
-                for old_key, until in list(_cf_timeout_until.items()):
-                    if until + CF_TIMEOUT_COOLDOWN <= now:
-                        del _cf_timeout_until[old_key]
-                _cf_timeout_until[key] = now + CF_TIMEOUT_COOLDOWN
-                log.warning(
-                    "[%s] CF WebSocket timed out (host=%s port=%d); "
-                    "retry in %.0fs",
-                    label, host, 443 if secure else 80, CF_TIMEOUT_COOLDOWN,
-                )
-            timeouts += 1
-            if timeouts >= len(CF_CONNECT_TIMEOUTS):
-                break
-            continue
-        except Exception as exc:
-            log.warning(
-                "[%s] CF WebSocket failed (host=%s port=%d): %r",
-                label, host, 443 if secure else 80, exc,
-            )
-        finally:
-            if retry_at is not None and _cf_timeout_until.get(key) == math.inf:
-                _cf_timeout_until[key] = retry_at
-
-        _cf_timeout_until.pop(key, None)
-        if ws is not None:
-            return ws, name
-
-    return None
