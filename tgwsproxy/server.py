@@ -9,7 +9,7 @@ import asyncio
 import logging
 import socket as _socket
 import time
-from typing import Optional, Set
+from typing import Dict, Optional
 
 from .balancer import balancer
 from ._aes import AES_BACKEND
@@ -34,6 +34,10 @@ from .ws_pool import WebSocketPool, cf_worker_pool
 
 log = logging.getLogger("tgwsproxy.server")
 
+# How long stop() waits for client tasks to close their sockets before
+# aborting the transports that still have unsent data queued.
+CLIENT_CLOSE_TIMEOUT = 2.0
+
 
 def _make_h2_pool(config: Config):
     """Create the CF HTTP/2 media pool if enabled and httpx/h2 are present."""
@@ -57,7 +61,7 @@ class ProxyServer:
         self._stop_event: Optional[asyncio.Event] = None
         self._serve_task: Optional[asyncio.Task] = None
         self._stats_task: Optional[asyncio.Task] = None
-        self._tasks: Set[asyncio.Task] = set()
+        self._tasks: Dict[asyncio.Task, asyncio.StreamWriter] = {}
         self._handler: Optional[ClientHandler] = None
         self._pool: Optional[WebSocketPool] = None
         self._h2_pool = None
@@ -224,13 +228,28 @@ class ProxyServer:
                 pass
             self._serve_task = None
 
-        for task in list(self._tasks):
+        clients = self._tasks.copy()
+        for task, writer in clients.items():
             task.cancel()
-        for task in list(self._tasks):
             try:
-                await task
-            except BaseException:
+                writer.close()
+            except Exception:
                 pass
+        if clients:
+            # Give the handlers a moment to flush their goodbyes, then abort
+            # anything still holding queued bytes so a silent peer cannot
+            # stall shutdown (and the following restart).
+            await asyncio.wait(clients, timeout=CLIENT_CLOSE_TIMEOUT)
+            for writer in clients.values():
+                transport = getattr(writer, "transport", None)
+                if transport is None:
+                    continue
+                try:
+                    if transport.get_write_buffer_size():
+                        transport.abort()
+                except Exception:
+                    pass
+            await asyncio.gather(*clients, return_exceptions=True)
         self._tasks.clear()
 
         if self._pool is not None:
@@ -287,8 +306,8 @@ class ProxyServer:
                 pass
             return
         task = asyncio.create_task(self._handler.handle(reader, writer))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        self._tasks[task] = writer
+        task.add_done_callback(lambda done: self._tasks.pop(done, None))
 
     def _set_nodelay(self) -> None:
         if self._server is None:
