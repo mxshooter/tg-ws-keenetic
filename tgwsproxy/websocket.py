@@ -56,6 +56,40 @@ def set_x25519(context: ssl.SSLContext) -> None:
         pass
 
 
+def _new_ssl_context() -> ssl.SSLContext:
+    """Create a client context even when the system CA store is broken.
+
+    `ssl.create_default_context()` reads the system store eagerly and may
+    raise on stripped-down Entware images. Falling back to an empty
+    `PROTOCOL_TLS_CLIENT` context keeps the proxy importable; verification
+    then fails at handshake time instead of preventing the service from
+    starting.
+    """
+    try:
+        return ssl.create_default_context()
+    except Exception as exc:
+        log.warning(
+            "System CA store unavailable (%r); starting with an empty "
+            "SSL context", exc,
+        )
+        return ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
+def _load_ca_bundle(context: ssl.SSLContext) -> None:
+    """Add certifi's CA bundle without dropping the system certificates.
+
+    Entware often ships no `ca-certificates` but may have `certifi` from
+    pip. Loading both keeps verification working on either setup, and a
+    missing or broken bundle is not fatal.
+    """
+    try:
+        import certifi  # type: ignore
+
+        context.load_verify_locations(cafile=certifi.where())
+    except Exception:
+        pass
+
+
 def create_ssl_context(
     *, check_hostname: bool = False, verify: bool = False
 ) -> ssl.SSLContext:
@@ -63,12 +97,14 @@ def create_ssl_context(
 
     Keenetic/Entware boxes rarely ship an up-to-date CA bundle, so certificate
     verification is disabled by default (matching the fork's historic
-    behaviour). Callers that need a verified context (e.g. HTTP/2 to
-    Cloudflare) can pass ``verify=True``.
+    behaviour). Callers that need a verified context (self-update, HTTP/2 to
+    Cloudflare) pass ``verify=True``; the system store and certifi are loaded
+    together.
     """
-    context = ssl.create_default_context()
+    context = _new_ssl_context()
     set_x25519(context)
     if verify:
+        _load_ca_bundle(context)
         context.check_hostname = check_hostname
     else:
         context.check_hostname = False

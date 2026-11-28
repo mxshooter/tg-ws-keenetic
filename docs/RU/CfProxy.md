@@ -74,6 +74,11 @@ TCP/TLS-соединение до Cloudflare для каждого DC и дом�
 `"cfproxy_h2_media": false` в `config.json`. Для самого HTTP/2 на роутере нужны
 `httpx` и `h2`; без них прокси автоматически работает через WS.
 
+Если в системе есть CA-сертификаты (`opkg install ca-certificates` или
+`pip3 install certifi`), TLS до Cloudflare проверяется по имени хоста. Если
+бандла нет, H2 продолжает работать без проверки и пишет об этом предупреждение
+в лог.
+
 ## Благодарности
 
 - Идея: https://github.com/Nekogram/WSProxy

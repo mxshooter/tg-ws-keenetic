@@ -7,6 +7,7 @@ can share one TCP connection to a Cloudflare Worker.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections import deque
 from functools import lru_cache
@@ -29,6 +30,8 @@ from h2.settings import SettingCodes, Settings
 
 from .websocket import create_ssl_context
 
+log = logging.getLogger("tgwsproxy.h2_transport")
+
 STREAM_RECEIVE_WINDOW = 256 * 1024
 CONNECTION_RECEIVE_WINDOW = 4 * 1024 * 1024
 IO_BATCH_SIZE = 64 * 1024
@@ -36,7 +39,23 @@ IO_BATCH_SIZE = 64 * 1024
 
 @lru_cache(maxsize=1)
 def _default_ssl_context():
-    context = create_ssl_context()
+    """Verified TLS for Cloudflare, with an unverified fallback.
+
+    `httpx` (required for H2) depends on `certifi`, so a CA bundle is
+    normally available even on Entware. When it is not, keep H2 usable by
+    falling back to an unverified context instead of failing every request.
+    """
+    context = create_ssl_context(check_hostname=True, verify=True)
+    try:
+        has_ca = context.cert_store_stats().get("x509_ca", 0) > 0
+    except Exception:
+        has_ca = False
+    if not has_ca:
+        log.warning(
+            "No CA certificates for HTTP/2; Cloudflare TLS is not verified "
+            "(install ca-certificates or certifi)"
+        )
+        context = create_ssl_context()
     context.set_alpn_protocols(["h2"])
     return context
 

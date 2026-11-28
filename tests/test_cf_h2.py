@@ -4,7 +4,7 @@ import struct
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 try:
     import httpx
@@ -18,6 +18,7 @@ from tgwsproxy.cf_h2 import (
     _ReplayPacket, _encode_reply, _read_packet, bridge_h2,
 )
 from tgwsproxy.cf_websocket import connect_cf_domains, reset_cf_timeouts
+from tgwsproxy.h2_transport import _default_ssl_context
 from tgwsproxy.websocket import RawWebSocket
 from tgwsproxy.constants import (
     PROTO_TAG_ABRIDGED,
@@ -1139,3 +1140,40 @@ class HttpMultiplexTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn('pkt=1', output)
         self.assertIn('replay=1 phase=complete', output)
         self.assertNotIn('samekey!', output)
+
+
+class DefaultSslContextTest(unittest.TestCase):
+    def setUp(self):
+        _default_ssl_context.cache_clear()
+        self.addCleanup(_default_ssl_context.cache_clear)
+
+    def test_verifies_when_a_ca_bundle_is_available(self):
+        context = Mock()
+        context.cert_store_stats.return_value = {"x509_ca": 2}
+        with patch(
+            "tgwsproxy.h2_transport.create_ssl_context", return_value=context
+        ) as create:
+            result = _default_ssl_context()
+
+        self.assertIs(result, context)
+        create.assert_called_once_with(check_hostname=True, verify=True)
+        context.set_alpn_protocols.assert_called_once_with(["h2"])
+
+    def test_falls_back_to_unverified_without_ca(self):
+        verified = Mock()
+        verified.cert_store_stats.return_value = {"x509_ca": 0}
+        plain = Mock()
+        with patch(
+            "tgwsproxy.h2_transport.create_ssl_context",
+            side_effect=[verified, plain],
+        ) as create:
+            result = _default_ssl_context()
+
+        self.assertIs(result, plain)
+        self.assertEqual(create.call_count, 2)
+        self.assertEqual(
+            create.call_args_list[0].kwargs,
+            {"check_hostname": True, "verify": True},
+        )
+        self.assertEqual(create.call_args_list[1].kwargs, {})
+        plain.set_alpn_protocols.assert_called_once_with(["h2"])

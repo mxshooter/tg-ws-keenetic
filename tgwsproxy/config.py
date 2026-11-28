@@ -25,6 +25,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .balancer import balancer
+from .websocket import create_ssl_context
 
 log = logging.getLogger("tgwsproxy.config")
 
@@ -108,15 +109,10 @@ def build_https_context() -> ssl.SSLContext:
     """TLS context for outbound GitHub/Cloudflare requests (certificates checked).
 
     Entware images often ship without a CA bundle. Prefer `certifi` when it is
-    installed (`pip3 install certifi`); otherwise use the system store, which
-    needs `opkg install ca-certificates` to work.
+    installed (`pip3 install certifi`); the system store is kept as well, so
+    either source is enough. A broken store does not prevent startup.
     """
-    try:
-        import certifi  # type: ignore
-
-        return ssl.create_default_context(cafile=certifi.where())
-    except ImportError:
-        return ssl.create_default_context()
+    return create_ssl_context(check_hostname=True, verify=True)
 
 
 def _is_valid_domain(domain: str) -> bool:
